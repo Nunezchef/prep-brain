@@ -4,7 +4,8 @@ from dotenv import load_dotenv
 def main() -> None:
     load_dotenv()
     print("prep-brain boot OK ✅")
-    print("T8352284171:AAFwESZ78TO6b6xPQbaMa73n5mtXEP0chpg set:", bool(os.getenv("T8352284171:AAFwESZ78TO6b6xPQbaMa73n5mtXEP0chpg")))
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    print("TELEGRAM_BOT_TOKEN set:", bool(token))
 
 if __name__ == "__main__":
     main()
