@@ -4,8 +4,10 @@ import logging
 import shutil
 import subprocess
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zipfile import ZipFile
 
 import chromadb
 import fitz  # pymupdf
@@ -22,6 +24,73 @@ PERSIST_DIRECTORY = "data/chroma_db"
 COLLECTION_NAME = "prep_brain_knowledge"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 SOURCES_FILE = "data/sources.json"
+DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+TIER_1_RECIPE_OPS = "tier1_recipe_ops"
+TIER_2_NOTES_SOPS = "tier2_notes_sops"
+TIER_3_REFERENCE_THEORY = "tier3_reference_theory"
+
+TIER_ALIASES = {
+    "tier1": TIER_1_RECIPE_OPS,
+    "tier1_recipe_ops": TIER_1_RECIPE_OPS,
+    "recipe": TIER_1_RECIPE_OPS,
+    "recipes": TIER_1_RECIPE_OPS,
+    "recipe_ops": TIER_1_RECIPE_OPS,
+    "restaurant_recipe": TIER_1_RECIPE_OPS,
+    "ops": TIER_1_RECIPE_OPS,
+    "operations": TIER_1_RECIPE_OPS,
+    "tier2": TIER_2_NOTES_SOPS,
+    "tier2_notes_sops": TIER_2_NOTES_SOPS,
+    "notes": TIER_2_NOTES_SOPS,
+    "note": TIER_2_NOTES_SOPS,
+    "sop": TIER_2_NOTES_SOPS,
+    "sops": TIER_2_NOTES_SOPS,
+    "tier3": TIER_3_REFERENCE_THEORY,
+    "tier3_reference_theory": TIER_3_REFERENCE_THEORY,
+    "reference": TIER_3_REFERENCE_THEORY,
+    "references": TIER_3_REFERENCE_THEORY,
+    "book": TIER_3_REFERENCE_THEORY,
+    "theory": TIER_3_REFERENCE_THEORY,
+    "science": TIER_3_REFERENCE_THEORY,
+}
+
+REFERENCE_KEYWORDS = [
+    "mcgee",
+    "on food and cooking",
+    "flavor bible",
+    "reference",
+    "textbook",
+    "food science",
+    "theory",
+    "chemistry",
+]
+
+NOTES_SOP_KEYWORDS = [
+    "note",
+    "notes",
+    "shift",
+    "post-service",
+    "service notes",
+    "debrief",
+    "sop",
+    "standard operating",
+]
+
+RECIPE_OPS_KEYWORDS = [
+    "recipe",
+    "prep",
+    "station",
+    "menu",
+    "dish",
+    "line build",
+    "plating",
+    "sauce",
+    "vinaigrette",
+    "custard",
+    "glaze",
+    "ops",
+    "operations",
+]
 
 DEFAULT_RAG_SETTINGS: Dict[str, Any] = {
     "ocr": {
@@ -45,6 +114,35 @@ DEFAULT_RAG_SETTINGS: Dict[str, Any] = {
         ),
     },
 }
+
+
+def normalize_knowledge_tier(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    return TIER_ALIASES.get(str(value).strip().lower())
+
+
+def infer_knowledge_tier(
+    source_type: str = "",
+    title: str = "",
+    source_name: str = "",
+    summary: str = "",
+) -> str:
+    normalized_source_type = normalize_knowledge_tier(source_type)
+    if normalized_source_type:
+        return normalized_source_type
+
+    haystack = " ".join([source_type, title, source_name, summary]).lower()
+
+    if any(keyword in haystack for keyword in REFERENCE_KEYWORDS):
+        return TIER_3_REFERENCE_THEORY
+    if any(keyword in haystack for keyword in NOTES_SOP_KEYWORDS):
+        return TIER_2_NOTES_SOPS
+    if any(keyword in haystack for keyword in RECIPE_OPS_KEYWORDS):
+        return TIER_1_RECIPE_OPS
+
+    # Default to operational authority so recipe queries don't accidentally route to reference books.
+    return TIER_1_RECIPE_OPS
 
 
 def load_runtime_config() -> Dict[str, Any]:
@@ -169,6 +267,18 @@ class RAGEngine:
             for source in sources:
                 if "collection_name" not in source:
                     source["collection_name"] = COLLECTION_NAME
+                    normalized = True
+
+                tier = normalize_knowledge_tier(source.get("knowledge_tier"))
+                if not tier:
+                    tier = infer_knowledge_tier(
+                        source_type=source.get("type", ""),
+                        title=source.get("title", ""),
+                        source_name=source.get("source_name", ""),
+                        summary=source.get("summary", ""),
+                    )
+                if source.get("knowledge_tier") != tier:
+                    source["knowledge_tier"] = tier
                     normalized = True
 
             if normalized:
@@ -387,6 +497,103 @@ class RAGEngine:
 
         return vision_chunks, warnings
 
+    def _docx_paragraph_text(self, paragraph_element: ET.Element) -> str:
+        texts = [node.text for node in paragraph_element.findall(".//w:t", DOCX_NS) if node.text]
+        return "".join(texts).strip()
+
+    def _extract_docx_text(self, path: Path) -> Tuple[str, int, int]:
+        lines: List[str] = []
+        paragraph_count = 0
+        table_row_count = 0
+
+        with ZipFile(path, "r") as archive:
+            if "word/document.xml" not in archive.namelist():
+                return "", 0, 0
+            xml_bytes = archive.read("word/document.xml")
+
+        root = ET.fromstring(xml_bytes)
+        body = root.find("w:body", DOCX_NS)
+        if body is None:
+            return "", 0, 0
+
+        paragraph_tag = f"{{{DOCX_NS['w']}}}p"
+        table_tag = f"{{{DOCX_NS['w']}}}tbl"
+
+        for child in list(body):
+            if child.tag == paragraph_tag:
+                paragraph_text = self._docx_paragraph_text(child)
+                if paragraph_text:
+                    lines.append(paragraph_text)
+                    paragraph_count += 1
+                continue
+
+            if child.tag != table_tag:
+                continue
+
+            for row_index, row in enumerate(child.findall("w:tr", DOCX_NS), start=1):
+                row_cells: List[str] = []
+                for cell in row.findall("w:tc", DOCX_NS):
+                    cell_paragraphs: List[str] = []
+                    for paragraph in cell.findall(".//w:p", DOCX_NS):
+                        paragraph_text = self._docx_paragraph_text(paragraph)
+                        if paragraph_text:
+                            cell_paragraphs.append(paragraph_text)
+                    row_cells.append(" ".join(cell_paragraphs).strip())
+
+                populated_cells = [cell for cell in row_cells if cell]
+                if populated_cells:
+                    row_text = " | ".join(populated_cells)
+                    lines.append(f"TABLE ROW {row_index}: {row_text}")
+                    table_row_count += 1
+
+        normalized_lines = [" ".join(line.split()) for line in lines if " ".join(line.split())]
+        return "\n".join(normalized_lines), paragraph_count, table_row_count
+
+    def _chunk_text_blocks(
+        self,
+        text: str,
+        heading: str = "General",
+        target_size: int = 900,
+        overlap_lines: int = 2,
+    ) -> List[Dict[str, str]]:
+        lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+        if not lines:
+            return []
+
+        chunks: List[Dict[str, str]] = []
+        current_lines: List[str] = []
+        current_length = 0
+
+        for line in lines:
+            line_length = len(line) + 1
+            if current_lines and current_length + line_length > target_size:
+                chunks.append({"text": "\n".join(current_lines), "heading": heading})
+                overlap = current_lines[-overlap_lines:] if overlap_lines > 0 else []
+                current_lines = list(overlap)
+                current_length = sum(len(value) + 1 for value in current_lines)
+
+            current_lines.append(line)
+            current_length += line_length
+
+        if current_lines:
+            chunks.append({"text": "\n".join(current_lines), "heading": heading})
+
+        # Safety split to avoid giant single-chunk ingestion for non-tiny documents.
+        if len(chunks) == 1:
+            compact_text = " ".join(lines)
+            if len(compact_text) > target_size * 2:
+                words = compact_text.split()
+                midpoint = len(words) // 2
+                first = " ".join(words[:midpoint]).strip()
+                second = " ".join(words[midpoint:]).strip()
+                if first and second:
+                    chunks = [
+                        {"text": first, "heading": heading},
+                        {"text": second, "heading": heading},
+                    ]
+
+        return chunks
+
     def get_sources(self) -> List[Dict[str, Any]]:
         return self._load_sources()
 
@@ -452,6 +659,15 @@ class RAGEngine:
         settings = self._get_settings()
         image_cfg = settings.get("image_processing", {})
         vision_cfg = settings.get("vision", {})
+        knowledge_tier = (
+            normalize_knowledge_tier(extra_metadata.get("knowledge_tier"))
+            or infer_knowledge_tier(
+                source_type=extra_metadata.get("source_type", "document"),
+                title=extra_metadata.get("source_title", path.stem),
+                source_name=path.name,
+                summary=extra_metadata.get("summary", ""),
+            )
+        )
 
         options = {
             "extract_images": bool(image_cfg.get("extract_images", False)),
@@ -465,6 +681,7 @@ class RAGEngine:
             options["extract_images"] = True
 
         is_pdf = path.suffix.lower() == ".pdf"
+        is_docx = path.suffix.lower() == ".docx"
         chunker = SmartChunker()
 
         warnings: List[str] = []
@@ -532,9 +749,46 @@ class RAGEngine:
                     }
                     for chunk in chunks
                 ]
+            elif is_docx:
+                extracted_text, paragraph_count, table_row_count = self._extract_docx_text(path)
+                logger.info(
+                    "DOCX extraction: file=%s raw_text_chars=%s paragraphs=%s table_rows=%s",
+                    path.name,
+                    len(extracted_text),
+                    paragraph_count,
+                    table_row_count,
+                )
+                text_chunks = self._chunk_text_blocks(
+                    extracted_text,
+                    heading="DOCX Content",
+                    target_size=900,
+                    overlap_lines=2,
+                )
+                logger.info("DOCX chunking: file=%s chunks_created=%s", path.name, len(text_chunks))
+                chunks_data = [
+                    {
+                        "text": chunk["text"],
+                        "heading": chunk["heading"],
+                        "kind": "text",
+                    }
+                    for chunk in text_chunks
+                ]
             else:
                 text = path.read_text(errors="replace")
-                chunks_data = [{"text": text, "heading": "General", "kind": "text"}]
+                text_chunks = self._chunk_text_blocks(
+                    text,
+                    heading="General",
+                    target_size=1000,
+                    overlap_lines=2,
+                )
+                chunks_data = [
+                    {
+                        "text": chunk["text"],
+                        "heading": chunk["heading"],
+                        "kind": "text",
+                    }
+                    for chunk in text_chunks
+                ]
 
             if not chunks_data:
                 return (
@@ -598,6 +852,7 @@ class RAGEngine:
                         "heading": item.get("heading", "General"),
                         "chunk_kind": item.get("kind", "text"),
                         "ocr_applied": bool(ocr_applied),
+                        "knowledge_tier": knowledge_tier,
                     }
                 )
 
@@ -623,6 +878,7 @@ class RAGEngine:
                 "collection_name": COLLECTION_NAME,
                 "title": extra_metadata.get("source_title", path.stem),
                 "type": extra_metadata.get("source_type", "document"),
+                "knowledge_tier": knowledge_tier,
                 "date_ingested": date_ingested,
                 "chunk_count": len(documents),
                 "status": "active",
@@ -658,6 +914,7 @@ class RAGEngine:
                 "image_rich": new_source["image_rich"],
                 "images_extracted": new_source["images_extracted"],
                 "vision_descriptions_count": new_source["vision_descriptions_count"],
+                "knowledge_tier": new_source["knowledge_tier"],
                 "warnings": warnings,
             }
             return True, result
@@ -673,7 +930,12 @@ class RAGEngine:
                 except Exception:
                     pass
 
-    def search(self, query_text: str, n_results: int = 5) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query_text: str,
+        n_results: int = 5,
+        source_tiers: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """Searches active sources from the configured collection for relevant context."""
         try:
             sources = self._load_sources()
@@ -683,7 +945,21 @@ class RAGEngine:
                 if source.get("status") == "active"
                 and source.get("collection_name", COLLECTION_NAME) == COLLECTION_NAME
             ]
+            requested_tiers = [
+                tier for tier in (normalize_knowledge_tier(value) for value in (source_tiers or [])) if tier
+            ]
+            if requested_tiers:
+                requested_set = set(requested_tiers)
+                active_entries = [
+                    source
+                    for source in active_entries
+                    if source.get("knowledge_tier", TIER_1_RECIPE_OPS) in requested_set
+                ]
             active_sources = [source["source_name"] for source in active_entries]
+            source_tier_by_name = {
+                source["source_name"]: source.get("knowledge_tier", TIER_1_RECIPE_OPS)
+                for source in active_entries
+            }
             collection_doc_count = self.collection.count()
             query_preview = " ".join((query_text or "").split())[:180]
             runtime_cfg = load_runtime_config()
@@ -692,13 +968,14 @@ class RAGEngine:
             enforce_similarity_threshold = bool(rag_cfg.get("enforce_similarity_threshold", False))
 
             logger.info(
-                "RAG search: collection=%s collection_docs=%s active_sources=%s n_results=%s similarity_threshold=%s enforce_similarity_threshold=%s query=%s",
+                "RAG search: collection=%s collection_docs=%s active_sources=%s n_results=%s similarity_threshold=%s enforce_similarity_threshold=%s source_tiers=%s query=%s",
                 COLLECTION_NAME,
                 collection_doc_count,
                 len(active_sources),
                 n_results,
                 similarity_threshold,
                 enforce_similarity_threshold,
+                requested_tiers if requested_tiers else "all",
                 query_preview,
             )
             logger.debug("RAG active source names: %s", active_sources[:20])
@@ -748,6 +1025,10 @@ class RAGEngine:
                             "source": metadata.get("source", "unknown"),
                             "heading": metadata.get("heading", ""),
                             "distance": distance if distance is not None else 0,
+                            "knowledge_tier": metadata.get(
+                                "knowledge_tier",
+                                source_tier_by_name.get(metadata.get("source", ""), TIER_1_RECIPE_OPS),
+                            ),
                         }
                     )
 

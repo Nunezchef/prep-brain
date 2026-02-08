@@ -16,7 +16,6 @@ import {
   Thermometer,
   Trash2,
   Upload,
-  Video,
 } from 'lucide-react'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000'
@@ -38,6 +37,7 @@ const defaultStatus = {
   telemetry: {
     battery: null,
     core_temp: null,
+    core_temp_estimated: false,
     signal: 0,
     position: 'KITCHEN A2',
   },
@@ -92,6 +92,37 @@ function statusPillClass(isRunning) {
     : 'border-hairline text-zinc-400 bg-white'
 }
 
+function ServiceSwitch({ label, running, status, onToggle }) {
+  return (
+    <div className="flex items-center justify-between rounded-xl border border-hairline bg-bone/35 px-3 py-3">
+      <div className="space-y-1">
+        <p className="tactical-label">{label}</p>
+        <p className={`text-xs font-semibold ${running ? 'text-emerald-600' : 'text-red-500'}`}>
+          {status}
+        </p>
+      </div>
+
+      <button
+        type="button"
+        role="switch"
+        aria-checked={running}
+        onClick={onToggle}
+        className={`relative h-7 w-14 rounded-full border transition-all duration-300 ease-atelier ${
+          running
+            ? 'border-emerald-500 bg-emerald-500/20'
+            : 'border-red-300 bg-red-500/10'
+        }`}
+      >
+        <span
+          className={`absolute top-1 h-5 w-5 rounded-full transition-all duration-300 ease-atelier ${
+            running ? 'left-8 bg-emerald-600' : 'left-1 bg-red-500'
+          }`}
+        />
+      </button>
+    </div>
+  )
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState('overview')
   const [statusData, setStatusData] = useState(defaultStatus)
@@ -133,7 +164,7 @@ function App() {
         id: 'core-temp',
         label: 'CORE TEMP',
         value: statusData.telemetry.core_temp !== null ? `${statusData.telemetry.core_temp}C` : '--',
-        detail: 'THERMAL SAFE RANGE',
+        detail: statusData.telemetry.core_temp_estimated ? 'ESTIMATED / SENSOR FALLBACK' : 'THERMAL SAFE RANGE',
         Icon: Thermometer,
       },
       {
@@ -215,7 +246,7 @@ function App() {
       return
     }
     try {
-      const payload = await apiRequest(`/api/sessions/${sessionId}/messages?limit=200`)
+      const payload = await apiRequest(`/api/sessions/${sessionId}/messages?limit=10`)
       setSessionMessages(payload.items || [])
     } catch (err) {
       emitError(`Session messages load failed: ${err.message}`)
@@ -310,13 +341,13 @@ function App() {
     }
   }
 
-  const startOllama = async () => {
+  const controlOllama = async (action) => {
     try {
-      const payload = await apiRequest('/api/control/ollama/start', { method: 'POST' })
+      const payload = await apiRequest(`/api/control/ollama/${action}`, { method: 'POST' })
       await loadStatus()
-      emitNotice(payload.message || 'Ollama start command sent.')
+      emitNotice(payload.message || `Ollama ${action} executed.`)
     } catch (err) {
-      emitError(`Ollama start failed: ${err.message}`)
+      emitError(`Ollama ${action} failed: ${err.message}`)
     }
   }
 
@@ -491,8 +522,7 @@ function App() {
           <div className="mx-auto max-w-[800px] px-4 py-4 sm:px-6">
             <div className="flex items-center justify-between gap-3">
               <div className="animate-in flex items-baseline gap-3">
-                <h1 className="text-base font-semibold tracking-tight">KERNEL // BOT-01</h1>
-                <span className="tactical-label">LOCAL BOT CONTROLLER</span>
+                <h1 className="text-base font-semibold tracking-tight">Prep-Brain Dashboard</h1>
               </div>
 
               <div className="animate-in text-right">
@@ -560,19 +590,28 @@ function App() {
                   <p className="tactical-label">CONTROL ACTIONS</p>
                   <RefreshCw {...iconProps} className="text-zinc-400" />
                 </div>
-                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                  <button type="button" onClick={() => controlBot('start')} className="rounded-xl border border-hairline px-3 py-2 text-[10px] font-bold tracking-[0.2em] hover:border-zinc-300">
-                    START BOT
-                  </button>
-                  <button type="button" onClick={() => controlBot('stop')} className="rounded-xl border border-hairline px-3 py-2 text-[10px] font-bold tracking-[0.2em] hover:border-zinc-300">
-                    STOP BOT
-                  </button>
-                  <button type="button" onClick={() => controlBot('restart')} className="rounded-xl border border-hairline px-3 py-2 text-[10px] font-bold tracking-[0.2em] hover:border-zinc-300">
-                    RESTART BOT
-                  </button>
-                  <button type="button" onClick={startOllama} className="rounded-xl border border-hairline px-3 py-2 text-[10px] font-bold tracking-[0.2em] hover:border-zinc-300">
-                    START OLLAMA
-                  </button>
+                <div className="space-y-3">
+                  <ServiceSwitch
+                    label="BOT"
+                    running={statusData.bot.running}
+                    status={statusData.bot.running ? 'RUNNING' : 'STOPPED'}
+                    onToggle={() => controlBot(statusData.bot.running ? 'stop' : 'start')}
+                  />
+                  <ServiceSwitch
+                    label="OLLAMA"
+                    running={statusData.ollama.running}
+                    status={statusData.ollama.running ? 'RUNNING' : 'STOPPED'}
+                    onToggle={() => controlOllama(statusData.ollama.running ? 'stop' : 'start')}
+                  />
+                  <div className="pt-1">
+                    <button
+                      type="button"
+                      onClick={() => controlBot('restart')}
+                      className="rounded-xl border border-hairline px-3 py-2 text-[10px] font-bold tracking-[0.2em] hover:border-zinc-300"
+                    >
+                      RESTART BOT
+                    </button>
+                  </div>
                 </div>
               </Panel>
 
@@ -593,17 +632,6 @@ function App() {
                   </Panel>
                 ))}
               </section>
-
-              <Panel className="overflow-hidden p-0">
-                <div className="relative aspect-video bg-zinc-100/60">
-                  <div className="crosshair absolute inset-0" />
-                  <div className="crosshair-center" />
-                  <div className="absolute left-5 top-5 flex items-center gap-2 rounded-full border border-hairline bg-white/90 px-3 py-1">
-                    <Video {...iconProps} className="text-zinc-400" />
-                    <span className="tactical-label">LIVE_STREAM_BUFFERING</span>
-                  </div>
-                </div>
-              </Panel>
 
               <Panel className="p-5">
                 <div className="mb-4 flex items-center justify-between">
@@ -636,7 +664,7 @@ function App() {
                   </div>
                 </div>
 
-                <div className="space-y-3">
+                <div className="max-h-80 space-y-3 overflow-y-auto pr-1">
                   {logs.length === 0 && <p className="text-sm text-zinc-400">No log entries available.</p>}
                   {logs.map((entry, index) => (
                     <div key={`${entry.ts}-${index}`} className="flex flex-col gap-1 border-b border-hairline/70 pb-3 last:border-b-0">
@@ -701,7 +729,8 @@ function App() {
                   </button>
                 </div>
 
-                <div className="space-y-3">
+                <p className="mb-3 text-xs text-zinc-400">Showing the latest 10 messages.</p>
+                <div className="max-h-96 space-y-3 overflow-y-auto pr-1">
                   {sessionMessages.length === 0 && <p className="text-sm text-zinc-400">No messages in selected session.</p>}
                   {sessionMessages.map((message) => (
                     <div key={message.id} className="rounded-xl border border-hairline p-3">

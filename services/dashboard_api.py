@@ -189,11 +189,28 @@ def restart_bot() -> Dict[str, Any]:
     return start_bot()
 
 
+def _list_ollama_pids() -> List[int]:
+    pids: List[int] = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            cmdline_parts = proc.info.get("cmdline") or []
+            cmdline = " ".join(cmdline_parts).lower()
+
+            is_ollama_binary = name == "ollama" or (cmdline_parts and Path(cmdline_parts[0]).name.lower() == "ollama")
+            is_ollama_serve = "ollama serve" in cmdline or (is_ollama_binary and "serve" in cmdline_parts)
+
+            if is_ollama_binary or is_ollama_serve:
+                pids.append(int(proc.info["pid"]))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, KeyError):
+            continue
+    return sorted(set(pids))
+
+
 def get_ollama_status() -> Dict[str, Any]:
     try:
-        result = subprocess.run(["pgrep", "-f", "ollama"], capture_output=True, text=True)
-        if result.returncode == 0:
-            pids = [int(p) for p in result.stdout.split() if p.strip().isdigit()]
+        pids = _list_ollama_pids()
+        if pids:
             return {"status": "Running", "running": True, "pids": pids}
         return {"status": "Stopped", "running": False, "pids": []}
     except Exception:
@@ -221,6 +238,35 @@ def start_ollama() -> Dict[str, Any]:
     return {
         "changed": True,
         "message": "Ollama start command sent.",
+        "status": get_ollama_status(),
+    }
+
+
+def stop_ollama() -> Dict[str, Any]:
+    status = get_ollama_status()
+    pids = status.get("pids", [])
+
+    if not pids:
+        return {"changed": False, "message": "Ollama was not running.", "status": status}
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+
+    time.sleep(0.8)
+
+    remaining = get_ollama_status().get("pids", [])
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            continue
+
+    return {
+        "changed": True,
+        "message": "Ollama stop command sent.",
         "status": get_ollama_status(),
     }
 
@@ -262,6 +308,16 @@ def get_telemetry(bot_running: bool, ollama_running: bool) -> Dict[str, Any]:
         except Exception:
             temp_value = None
 
+    core_temp_estimated = False
+    if temp_value is None:
+        try:
+            # Fallback estimate when host sensors are unavailable (common on macOS).
+            cpu = float(psutil.cpu_percent(interval=0.15))
+            temp_value = 36.0 + (cpu * 0.42)
+            core_temp_estimated = True
+        except Exception:
+            temp_value = None
+
     signal_value = 98 if (bot_running and ollama_running) else 74 if (bot_running or ollama_running) else 39
 
     config = load_config()
@@ -270,6 +326,7 @@ def get_telemetry(bot_running: bool, ollama_running: bool) -> Dict[str, Any]:
     return {
         "battery": battery_pct,
         "core_temp": round(temp_value, 1) if temp_value is not None else None,
+        "core_temp_estimated": core_temp_estimated,
         "signal": signal_value,
         "position": position,
     }
@@ -389,6 +446,11 @@ def control_ollama_start() -> Dict[str, Any]:
     return start_ollama()
 
 
+@app.post("/api/control/ollama/stop")
+def control_ollama_stop() -> Dict[str, Any]:
+    return stop_ollama()
+
+
 @app.get("/api/logs")
 def logs(lines: int = 120, level: str = "all") -> Dict[str, Any]:
     level_filter = level.lower().strip()
@@ -447,8 +509,8 @@ async def knowledge_upload(
     name = Path(file.filename or "uploaded").name
     suffix = Path(name).suffix.lower()
 
-    if suffix not in {".pdf", ".txt"}:
-        raise HTTPException(status_code=400, detail="Only .pdf and .txt files are supported")
+    if suffix not in {".pdf", ".txt", ".docx"}:
+        raise HTTPException(status_code=400, detail="Only .pdf, .txt, and .docx files are supported")
 
     target = BASE_DIR / "data" / "documents" / name
     target.parent.mkdir(parents=True, exist_ok=True)

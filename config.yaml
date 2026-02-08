@@ -60,3 +60,4 @@ system_prompt: |
 telegram:
   allowed_user_ids: []
   bot_token_env_var: TELEGRAM_BOT_TOKEN
+  max_document_size_mb: 50
