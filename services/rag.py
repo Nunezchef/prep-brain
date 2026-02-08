@@ -163,7 +163,18 @@ class RAGEngine:
     def _load_sources(self) -> List[Dict[str, Any]]:
         try:
             with open(self.sources_file, "r") as f:
-                return json.load(f)
+                sources = json.load(f)
+
+            normalized = False
+            for source in sources:
+                if "collection_name" not in source:
+                    source["collection_name"] = COLLECTION_NAME
+                    normalized = True
+
+            if normalized:
+                self._save_sources(sources)
+
+            return sources
         except Exception:
             return []
 
@@ -609,6 +620,7 @@ class RAGEngine:
             new_source = {
                 "id": source_id,
                 "source_name": path.name,
+                "collection_name": COLLECTION_NAME,
                 "title": extra_metadata.get("source_title", path.stem),
                 "type": extra_metadata.get("source_type", "document"),
                 "date_ingested": date_ingested,
@@ -661,13 +673,52 @@ class RAGEngine:
                 except Exception:
                     pass
 
-    def query(self, query_text: str, n_results: int = 5) -> List[Dict[str, Any]]:
-        """Searches the vector DB for relevant context."""
+    def search(self, query_text: str, n_results: int = 5) -> List[Dict[str, Any]]:
+        """Searches active sources from the configured collection for relevant context."""
         try:
             sources = self._load_sources()
-            active_sources = [source["source_name"] for source in sources if source.get("status") == "active"]
+            active_entries = [
+                source
+                for source in sources
+                if source.get("status") == "active"
+                and source.get("collection_name", COLLECTION_NAME) == COLLECTION_NAME
+            ]
+            active_sources = [source["source_name"] for source in active_entries]
+            collection_doc_count = self.collection.count()
+            query_preview = " ".join((query_text or "").split())[:180]
+            runtime_cfg = load_runtime_config()
+            rag_cfg = runtime_cfg.get("rag", {}) if isinstance(runtime_cfg, dict) else {}
+            similarity_threshold = rag_cfg.get("similarity_threshold", None)
+            enforce_similarity_threshold = bool(rag_cfg.get("enforce_similarity_threshold", False))
+
+            logger.info(
+                "RAG search: collection=%s collection_docs=%s active_sources=%s n_results=%s similarity_threshold=%s enforce_similarity_threshold=%s query=%s",
+                COLLECTION_NAME,
+                collection_doc_count,
+                len(active_sources),
+                n_results,
+                similarity_threshold,
+                enforce_similarity_threshold,
+                query_preview,
+            )
+            logger.debug("RAG active source names: %s", active_sources[:20])
+
+            mismatched_sources = [
+                source.get("source_name", "unknown")
+                for source in sources
+                if source.get("status") == "active"
+                and source.get("collection_name")
+                and source.get("collection_name") != COLLECTION_NAME
+            ]
+            if mismatched_sources:
+                logger.warning(
+                    "RAG source/collection mismatch detected. current_collection=%s mismatched_sources=%s",
+                    COLLECTION_NAME,
+                    mismatched_sources[:20],
+                )
 
             if not active_sources:
+                logger.warning("RAG search skipped: no active sources.")
                 return []
 
             results = self.collection.query(
@@ -680,19 +731,54 @@ class RAGEngine:
             if results.get("documents"):
                 for i, document in enumerate(results["documents"][0]):
                     metadata = results["metadatas"][0][i]
+                    distance = results["distances"][0][i] if "distances" in results else None
+                    if (
+                        enforce_similarity_threshold
+                        and similarity_threshold is not None
+                        and distance is not None
+                    ):
+                        try:
+                            if float(distance) > float(similarity_threshold):
+                                continue
+                        except Exception:
+                            pass
                     output.append(
                         {
                             "content": document,
                             "source": metadata.get("source", "unknown"),
                             "heading": metadata.get("heading", ""),
-                            "distance": results["distances"][0][i] if "distances" in results else 0,
+                            "distance": distance if distance is not None else 0,
                         }
                     )
+
+            logger.info("RAG search returned %s chunks.", len(output))
+
+            if not output:
+                try:
+                    unfiltered = self.collection.query(
+                        query_texts=[query_text],
+                        n_results=1,
+                    )
+                    unfiltered_hits = len((unfiltered.get("documents") or [[]])[0])
+                    if unfiltered_hits > 0:
+                        top_meta = (unfiltered.get("metadatas") or [[{}]])[0][0] or {}
+                        logger.warning(
+                            "RAG retrieval returned 0 with active-source filter; unfiltered hits exist. "
+                            "top_unfiltered_source=%s active_sources=%s",
+                            top_meta.get("source", "unknown"),
+                            active_sources[:20],
+                        )
+                except Exception as diagnostic_error:
+                    logger.warning("RAG retrieval diagnostic failed: %s", diagnostic_error)
             return output
 
         except Exception as exc:
-            logger.error("RAG Query error: %s", exc)
+            logger.error("RAG search error: %s", exc)
             return []
+
+    def query(self, query_text: str, n_results: int = 5) -> List[Dict[str, Any]]:
+        """Backward-compatible alias for search()."""
+        return self.search(query_text=query_text, n_results=n_results)
 
     def clear_database(self) -> None:
         self.chroma_client.delete_collection(COLLECTION_NAME)
