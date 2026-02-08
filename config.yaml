@@ -10,6 +10,19 @@ rag:
   enabled: true
   top_k: 3
   similarity_threshold: 0.5
+  ocr:
+    enabled: true
+    tool: ocrmypdf
+    image_page_ratio_threshold: 0.6
+    min_text_chars_per_page: 300
+    low_text_char_threshold: 500
+  image_processing:
+    extract_images: false
+    max_images: 30
+  vision:
+    enabled: false
+    model: ''
+    max_images: 8
 paths:
   log_file: logs/prep-brain.log
   ollama_log_file: logs/ollama.log

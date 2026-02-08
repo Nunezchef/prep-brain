@@ -9,3 +9,6 @@ pymupdf
 sentence-transformers
 numpy<2
 psutil
+fastapi
+uvicorn
+python-multipart

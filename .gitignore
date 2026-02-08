@@ -29,6 +29,10 @@ run/
 # AI Models
 models/
 
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+
 # Book-specific scripts (do not commit copyrighted references)
 scripts/reingest_flavor_bible.py
 scripts/*_bible*.py

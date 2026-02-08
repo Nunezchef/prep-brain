@@ -267,11 +267,36 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "summary": learned_summary
         }
 
-        success, result = rag_engine.ingest_file(str(local_path), extra_metadata=extra_metadata)
+        rag_cfg = CONFIG.get("rag", {})
+        ingestion_options = {
+            "extract_images": bool(rag_cfg.get("image_processing", {}).get("extract_images", False)),
+            "vision_descriptions": bool(rag_cfg.get("vision", {}).get("enabled", False)),
+        }
+
+        success, result = rag_engine.ingest_file(
+            str(local_path),
+            extra_metadata=extra_metadata,
+            ingestion_options=ingestion_options,
+        )
         
         if success:
             num_chunks = result.get("num_chunks", 0)
             title = result.get("source_title", source_title)
+            ocr_applied = bool(result.get("ocr_applied", False))
+            image_rich = bool(result.get("image_rich", False))
+            images_extracted = int(result.get("images_extracted", 0))
+            vision_desc = int(result.get("vision_descriptions_count", 0))
+            warnings = result.get("warnings", []) or []
+
+            processing_notes = []
+            if ocr_applied:
+                processing_notes.append("• OCR applied with `ocrmypdf`")
+            if image_rich:
+                processing_notes.append("• Source flagged as image-rich")
+            if images_extracted:
+                processing_notes.append(f"• Extracted images: **{images_extracted}**")
+            if vision_desc:
+                processing_notes.append(f"• Vision descriptions indexed: **{vision_desc}**")
 
             msg = (
                 f"📘 **Knowledge added: {title}**\n\n"
@@ -279,8 +304,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"Entries added: **{num_chunks}**\n"
                 f"{impact_text}"
             )
+
+            if processing_notes:
+                msg += "\n\n" + "\n".join(processing_notes)
             
             await update.message.reply_text(msg, parse_mode="Markdown")
+            if warnings:
+                warning_msg = "⚠️ Notes:\n" + "\n".join(f"- {w}" for w in warnings[:3])
+                await update.message.reply_text(warning_msg)
         else:
              error_msg = result if isinstance(result, str) else "Unknown error"
              await update.message.reply_text(f"⚠️ Ingestion failed: {error_msg}")
