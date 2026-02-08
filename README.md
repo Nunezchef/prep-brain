@@ -5,7 +5,7 @@
 Prep-Brain is a local, voice-first restaurant assistant that helps you think, remember, and act under real kitchen conditions: not demos, not hype, not "AI for vibes."
 
 You talk to it through Telegram.  
-It listens, remembers context, reasons with your documents, and answers clearly.
+It listens, remembers context, retrieves from your documents, and answers clearly.
 
 Think of it as a senior operations brain that knows your restaurants, your systems, and your constraints, and stays quiet when it should.
 
@@ -61,30 +61,27 @@ The dashboard exists for trust and control, not decoration.
 
 ## Knowledge and RAG (How It Actually Works)
 
-Prep-Brain uses a Retrieval-Augmented Generation (RAG) system to reason over your documents.
+Prep-Brain uses a Retrieval-Augmented Generation (RAG) system to index and retrieve from your documents.
 
 You can ingest:
 
-- PDFs
-- SOPs
-- Prep bibles
-- Recipes
-- Station notes
-- Menus
-- Vendor sheets
-- Post-service notes
+- PDFs (recipes, reference materials, vendor catalogs)
+- SOPs (standard operating procedures)
+- Prep sheets and station notes
+- Menus and tasting notes
+- Post-service notes and retrospectives
+- Vendor sheets and ordering guides
 
 Each source is:
 
-- Indexed
-- Embedded
-- Stored with metadata
+- Indexed with semantic embeddings
+- Stored with metadata (title, type, date)
 - Individually controllable (`active` / `disabled` / removed)
 
 Important:
 
-- The assistant does not blindly "learn" documents.
-- It retrieves relevant sections and reasons over them at runtime.
+- The assistant does not "learn" documents like a human.
+- It indexes content, retrieves relevant sections at runtime, and grounds answers in those sections.
 - Sources are always inspectable and reversible.
 - Retrieval only uses sources marked active.
 
@@ -120,8 +117,7 @@ prep-brain/
 │   ├── app.py           # Main Streamlit control panel
 │   └── pages/           # Sessions, Test Lab, Settings, Knowledge
 ├── scripts/
-│   ├── verify_rag.py
-│   └── reingest_flavor_bible.py
+│   └── verify_rag.py    # RAG verification tool
 ├── config.yaml
 ├── .env.example
 └── requirements.txt

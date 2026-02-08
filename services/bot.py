@@ -253,30 +253,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         # Determine metadata & summary
         source_title = local_path.stem.replace("_", " ").title()
-        is_flavor_bible = "flavor" in file_name.lower() and "bible" in file_name.lower()
         
-        if is_flavor_bible:
-            description_bullets = (
-                "• Ingredient-based flavor pairing references\n"
-                "• Cross-cuisine affinity patterns\n"
-                "• Balancing heuristics for fat, acid, heat, and aromatics"
-            )
-            impact_text = "This reference will now inform flavor pairing and menu-development reasoning."
-            learned_summary = (
-                "This source added ingredient-based flavor pairing references, "
-                "cross-cuisine affinity patterns, and balancing heuristics for fat, acid, heat, and aromatics."
-            )
-        else:
-             description_bullets = (
-                "• Content indexed for semantic retrieval\n"
-                "• Technical reference material"
-            )
-             impact_text = "This document is now available for context retrieval."
-             learned_summary = "Content indexed for semantic retrieval."
+        description_bullets = (
+            "• Content indexed for semantic retrieval\n"
+            "• Available for context-aware queries"
+        )
+        impact_text = "This document is now available for context retrieval."
+        learned_summary = "Content indexed for semantic retrieval."
 
         extra_metadata = {
             "source_title": source_title,
-            "source_type": "reference_book" if is_flavor_bible else "document",
+            "source_type": "document",
             "summary": learned_summary
         }
 
