@@ -1,0 +1,3 @@
+-- Canonical Prep-Brain schema source.
+-- Runtime migrations are currently applied by services.memory.init_db().
+-- Keep this file aligned as the schema is consolidated into prep_brain/db.

@@ -1,20 +1,28 @@
 import base64
+import datetime
+import html
+import hashlib
 import json
 import logging
+import os
+import re
 import shutil
 import subprocess
 import uuid
-import xml.etree.ElementTree as ET
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from zipfile import ZipFile
 
 import chromadb
 import fitz  # pymupdf
 import requests
-import yaml
 from chromadb.utils import embedding_functions
 from sentence_transformers import SentenceTransformer
+
+from services import memory
+from services.command_runner import CommandRunner
+from services.doc_extract import detect_images_in_docx, extract_docx_images, extract_text
+from prep_brain.config import load_config
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -24,7 +32,6 @@ PERSIST_DIRECTORY = "data/chroma_db"
 COLLECTION_NAME = "prep_brain_knowledge"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 SOURCES_FILE = "data/sources.json"
-DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
 TIER_1_RECIPE_OPS = "tier1_recipe_ops"
 TIER_2_NOTES_SOPS = "tier2_notes_sops"
@@ -92,6 +99,41 @@ RECIPE_OPS_KEYWORDS = [
     "operations",
 ]
 
+HOUSE_RECIPE_DOC_KEYWORDS = [
+    "recipe book",
+    "house recipe",
+    "fire recipe",
+    "prep recipe",
+    "line recipe",
+    "dish book",
+]
+
+VENDOR_DOC_KEYWORDS = [
+    "vendor",
+    "vendors",
+    "price list",
+    "catalog",
+    "invoice",
+    "order guide",
+    "supplier",
+]
+
+SOP_DOC_KEYWORDS = [
+    "sop",
+    "standard operating procedure",
+    "standard operating",
+    "policy",
+    "procedure",
+]
+
+PREP_NOTE_KEYWORDS = [
+    "prep notes",
+    "prep list",
+    "prep sheet",
+    "production notes",
+    "mise",
+]
+
 DEFAULT_RAG_SETTINGS: Dict[str, Any] = {
     "ocr": {
         "enabled": True,
@@ -113,7 +155,202 @@ DEFAULT_RAG_SETTINGS: Dict[str, Any] = {
             "Focus on ingredients, measurements, steps, labels, tables, and constraints."
         ),
     },
+    "chunking": {
+        "chunk_size_chars": 3500,
+        "chunk_overlap_chars": 400,
+        "minimum_chunk_chars": 400,
+        "dedupe_enabled": True,
+    },
+    "docx": {
+        "image_only_text_threshold": 5000,
+    },
 }
+
+RECIPE_QUERY_PREFIX_RE = re.compile(
+    r"(?i)\b(?:what(?:'s| is)?|show|give|send|need|recipe|for|the|our|please|how|to|make|of)\b"
+)
+NON_RECIPE_TITLE_KEYS = {
+    "recipes book",
+    "recipe book",
+    "ratio",
+    "method",
+    "ingredients",
+    "base",
+    "general",
+}
+SECTION_NAME_ALIASES = {
+    "ingredient": "Ingredients",
+    "ingredients": "Ingredients",
+    "base": "Base",
+    "base recipe": "Base",
+    "method": "Method",
+    "instructions": "Method",
+    "grind and add": "Grind and add",
+    "finish": "Finish",
+    "for service": "For service",
+    "part 1": "Part 1",
+    "part 2": "Part 2",
+    "part 3": "Part 3",
+}
+METHOD_SECTION_KEYS = {"method", "instructions"}
+ACTION_SECTION_KEYS = {"grind and add", "finish", "for service"}
+INGREDIENT_LINE_RE = re.compile(
+    r"^\s*(?:[-•]\s*)?(?:\d+(?:\.\d+)?)\s*(?:[a-zA-Z#%]{1,12})\b"
+)
+STEP_LINE_RE = re.compile(r"^\s*\d+[\.)]\s+")
+
+
+def _normalize_key(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    cleaned = re.sub(r"[^a-z0-9\s]+", " ", lowered)
+    return " ".join(cleaned.split()).strip()
+
+
+def _normalize_recipe_query_target(query_text: str) -> str:
+    cleaned = RECIPE_QUERY_PREFIX_RE.sub(" ", str(query_text or ""))
+    cleaned = re.sub(r"[\"'`]+", " ", cleaned)
+    cleaned = re.sub(r"[^a-zA-Z0-9\s-]+", " ", cleaned)
+    return " ".join(cleaned.split()).strip()
+
+
+def _split_table_row_cells(line: str) -> List[str]:
+    text = str(line or "").strip()
+    if not text.startswith("|") or "|" not in text:
+        return [text]
+    parts = [part.strip() for part in text.strip("|").split("|")]
+    return [part for part in parts if part]
+
+
+def _is_ingredient_line(line: str) -> bool:
+    text = str(line or "").strip()
+    if not text:
+        return False
+    if INGREDIENT_LINE_RE.match(text):
+        return True
+    compact = text.replace(" ", "")
+    return bool(re.match(r"^\d+(?:\.\d+)?#", compact))
+
+
+def _detect_section_name(line: str) -> Optional[str]:
+    text = str(line or "").strip()
+    if not text:
+        return None
+    base = text.rstrip(":").strip()
+    norm = _normalize_key(base)
+    if not norm:
+        return None
+    mapped = SECTION_NAME_ALIASES.get(norm)
+    if mapped:
+        return mapped
+    if text.endswith(":") and len(norm.split()) <= 6 and not _is_ingredient_line(text):
+        return base
+    return None
+
+
+def _looks_like_recipe_title(line: str) -> bool:
+    text = str(line or "").strip()
+    if not text:
+        return False
+    if text.startswith("#") or text.endswith(":") or STEP_LINE_RE.match(text):
+        return False
+    if _is_ingredient_line(text):
+        return False
+    if any(ch.isdigit() for ch in text):
+        return False
+    words = text.split()
+    if len(words) == 0 or len(words) > 8:
+        return False
+    if len(text) < 3 or len(text) > 80:
+        return False
+    norm = _normalize_key(text)
+    if norm in NON_RECIPE_TITLE_KEYS:
+        return False
+    if not any(ch.isalpha() for ch in text):
+        return False
+    return True
+
+
+def _parse_recipe_entries_from_chunk(text: str, chunk_id: int) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    current_recipe: Optional[str] = None
+    current_section = "Base"
+    local_order = 0
+
+    raw_lines = [line for line in str(text or "").splitlines() if line.strip()]
+    for raw in raw_lines:
+        expanded = _split_table_row_cells(raw.strip())
+        for cell in expanded:
+            line = " ".join(cell.split()).strip()
+            if not line:
+                continue
+            if line.startswith("## "):
+                continue
+
+            if _looks_like_recipe_title(line):
+                current_recipe = line
+                current_section = "Base"
+                continue
+
+            section = _detect_section_name(line)
+            if section and current_recipe:
+                current_section = section
+                continue
+
+            if not current_recipe:
+                continue
+
+            local_order += 1
+            kind = "ingredient" if _is_ingredient_line(line) else "method"
+            entries.append(
+                {
+                    "recipe_name": current_recipe,
+                    "section_name": current_section,
+                    "line": line,
+                    "kind": kind,
+                    "chunk_id": int(chunk_id),
+                    "order_index": local_order,
+                }
+            )
+
+    return entries
+
+
+def _title_match_score(target: str, candidate: str) -> float:
+    left = _normalize_key(target)
+    right = _normalize_key(candidate)
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    score = SequenceMatcher(None, left, right).ratio()
+    left_tokens = set(left.split())
+    right_tokens = set(right.split())
+    if left_tokens and right_tokens:
+        overlap = len(left_tokens & right_tokens) / max(len(left_tokens), 1)
+        score = max(score, overlap)
+    return float(score)
+
+
+def _format_house_recipe_html(
+    *,
+    recipe_name: str,
+    source_title: str,
+    ingredient_sections: List[Tuple[str, List[str]]],
+    method_lines: List[str],
+) -> str:
+    out: List[str] = [
+        f"<b>{html.escape(recipe_name)}</b>",
+        f"<i>Source: {html.escape(source_title)}</i>",
+        "",
+    ]
+    for section_name, lines in ingredient_sections:
+        out.append(f"<b>{html.escape(section_name)}</b>")
+        for line in lines:
+            out.append(f"• {html.escape(line)}")
+        out.append("")
+    out.append("<b>Method</b>")
+    out.append(html.escape(" ".join(method_lines).strip()))
+    return "\n".join(out).strip()
 
 
 def normalize_knowledge_tier(value: Optional[str]) -> Optional[str]:
@@ -141,18 +378,38 @@ def infer_knowledge_tier(
     if any(keyword in haystack for keyword in RECIPE_OPS_KEYWORDS):
         return TIER_1_RECIPE_OPS
 
-    # Default to operational authority so recipe queries don't accidentally route to reference books.
-    return TIER_1_RECIPE_OPS
+    # Safety default: ambiguous documents are treated as reference.
+    return TIER_3_REFERENCE_THEORY
+
+
+def classify_document_type(
+    *,
+    title: str = "",
+    source_name: str = "",
+    summary: str = "",
+) -> Tuple[str, str]:
+    """Classify uploaded documents for safe ingestion routing."""
+    haystack = " ".join([title, source_name, summary]).lower()
+
+    if any(keyword in haystack for keyword in REFERENCE_KEYWORDS):
+        return "reference_book", TIER_3_REFERENCE_THEORY
+    if any(keyword in haystack for keyword in VENDOR_DOC_KEYWORDS):
+        return "vendor_list", TIER_1_RECIPE_OPS
+    if any(keyword in haystack for keyword in SOP_DOC_KEYWORDS):
+        return "sop", TIER_2_NOTES_SOPS
+    if any(keyword in haystack for keyword in PREP_NOTE_KEYWORDS):
+        return "prep_notes", TIER_1_RECIPE_OPS
+    if any(keyword in haystack for keyword in HOUSE_RECIPE_DOC_KEYWORDS):
+        return "house_recipe_book", TIER_1_RECIPE_OPS
+    if any(keyword in haystack for keyword in RECIPE_OPS_KEYWORDS):
+        return "house_recipe_book", TIER_1_RECIPE_OPS
+
+    # Ambiguous defaults to reference-only handling.
+    return "unknown", TIER_3_REFERENCE_THEORY
 
 
 def load_runtime_config() -> Dict[str, Any]:
-    config_path = Path("config.yaml")
-    if not config_path.exists():
-        return {}
-    try:
-        return yaml.safe_load(config_path.read_text()) or {}
-    except Exception:
-        return {}
+    return load_config()
 
 
 def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -163,6 +420,36 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
         else:
             merged[key] = value
     return merged
+
+
+def _map_doc_source_type(source_type: str, knowledge_tier: str) -> str:
+    lowered = str(source_type or "").strip().lower()
+    if knowledge_tier == TIER_3_REFERENCE_THEORY:
+        return "general_knowledge"
+    if lowered in {"general_knowledge_web"}:
+        return "general_knowledge_web"
+    if lowered in {"house_recipe_book", "house_recipe_document", "house_recipe", "prep_notes", "vendor_list"}:
+        return "restaurant_recipes"
+    if knowledge_tier in {TIER_1_RECIPE_OPS, TIER_2_NOTES_SOPS}:
+        return "restaurant_recipes"
+    if knowledge_tier == TIER_3_REFERENCE_THEORY:
+        return "general_knowledge"
+    return "unknown"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fp:
+        while True:
+            chunk = fp.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _iso_now() -> str:
+    return datetime.datetime.now().isoformat()
 
 
 class SmartChunker:
@@ -235,6 +522,9 @@ class SmartChunker:
 class RAGEngine:
     def __init__(self):
         Path(PERSIST_DIRECTORY).parent.mkdir(parents=True, exist_ok=True)
+        self.ingest_reports_dir = Path("data/ingest_reports")
+        self.ingest_reports_dir.mkdir(parents=True, exist_ok=True)
+        self.docx_ocr_runner = CommandRunner(allowed_commands={"tesseract"})
 
         self.chroma_client = chromadb.PersistentClient(
             path=PERSIST_DIRECTORY,
@@ -257,6 +547,101 @@ class RAGEngine:
             self._save_sources([])
 
         logger.info("RAG Engine initialized. Collection size: %s", self.collection.count())
+
+    def _persist_doc_source(
+        self,
+        *,
+        ingest_id: str,
+        filename: str,
+        source_type: str,
+        restaurant_tag: Optional[str],
+        file_sha256: str,
+        file_size: int,
+        extracted_text_chars: int,
+        chunk_count: int,
+        chunks_added: int,
+        status: str,
+    ) -> None:
+        con = memory.get_conn()
+        try:
+            con.execute(
+                """
+                INSERT INTO doc_sources (
+                    ingest_id, filename, source_type, restaurant_tag, file_sha256, file_size,
+                    extracted_text_chars, chunk_count, chunks_added, status, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ingest_id) DO UPDATE SET
+                    filename = excluded.filename,
+                    source_type = excluded.source_type,
+                    restaurant_tag = excluded.restaurant_tag,
+                    file_sha256 = excluded.file_sha256,
+                    file_size = excluded.file_size,
+                    extracted_text_chars = excluded.extracted_text_chars,
+                    chunk_count = excluded.chunk_count,
+                    chunks_added = excluded.chunks_added,
+                    status = excluded.status,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    ingest_id,
+                    filename,
+                    source_type,
+                    restaurant_tag,
+                    file_sha256,
+                    int(file_size),
+                    int(extracted_text_chars),
+                    int(chunk_count),
+                    int(chunks_added),
+                    status,
+                    _iso_now(),
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def _write_ingest_report(self, ingest_id: str, payload: Dict[str, Any]) -> None:
+        report_path = self.ingest_reports_dir / f"{ingest_id}.json"
+        report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+    def list_ingest_reports(self, limit: int = 20) -> List[Dict[str, Any]]:
+        if not self.ingest_reports_dir.exists():
+            return []
+        files = sorted(self.ingest_reports_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        output: List[Dict[str, Any]] = []
+        for file in files[: max(1, min(limit, 100))]:
+            try:
+                payload = json.loads(file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            output.append(
+                {
+                    "ingest_id": payload.get("ingest_id") or file.stem,
+                    "filename": payload.get("raw_document", {}).get("filename") or "",
+                    "status": payload.get("status") or "unknown",
+                    "created_at": payload.get("created_at") or "",
+                }
+            )
+        return output
+
+    def load_ingest_report(self, ingest_id_or_prefix: str) -> Optional[Dict[str, Any]]:
+        needle = str(ingest_id_or_prefix or "").strip()
+        if not needle:
+            return None
+        exact = self.ingest_reports_dir / f"{needle}.json"
+        if exact.exists():
+            try:
+                return json.loads(exact.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+
+        matches = sorted(self.ingest_reports_dir.glob(f"{needle}*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not matches:
+            return None
+        try:
+            return json.loads(matches[0].read_text(encoding="utf-8"))
+        except Exception:
+            return None
 
     def _load_sources(self) -> List[Dict[str, Any]]:
         try:
@@ -451,7 +836,7 @@ class RAGEngine:
             )
             return vision_chunks, warnings
 
-        base_url = ollama_cfg.get("base_url", "http://localhost:11434")
+        base_url = os.environ.get("OLLAMA_URL") or ollama_cfg.get("base_url", "http://localhost:11434")
         prompt = vision_cfg.get(
             "prompt",
             "Describe the key operational and culinary information in this image.",
@@ -497,102 +882,548 @@ class RAGEngine:
 
         return vision_chunks, warnings
 
-    def _docx_paragraph_text(self, paragraph_element: ET.Element) -> str:
-        texts = [node.text for node in paragraph_element.findall(".//w:t", DOCX_NS) if node.text]
-        return "".join(texts).strip()
+    def _ocr_docx_images(self, path: Path, ingest_id: str) -> Tuple[str, int, List[str]]:
+        warnings: List[str] = []
+        images_dir = Path("data/tmp/images") / ingest_id
+        image_paths = extract_docx_images(str(path), str(images_dir))
+        ocr_parts: List[str] = []
+        ocr_ok = 0
+        for image_path in image_paths:
+            try:
+                result = self.docx_ocr_runner.run(
+                    ["tesseract", image_path, "stdout"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                )
+                text = (result.stdout or "").strip()
+                if text:
+                    ocr_parts.append(text)
+                    ocr_ok += 1
+            except Exception as exc:
+                warnings.append(f"OCR failed for {Path(image_path).name}: {exc}")
+        return "\n\n".join(ocr_parts).strip(), ocr_ok, warnings
 
-    def _extract_docx_text(self, path: Path) -> Tuple[str, int, int]:
-        lines: List[str] = []
-        paragraph_count = 0
-        table_row_count = 0
+    def _is_heading_line(self, line: str) -> bool:
+        text = str(line or "").strip()
+        if not text:
+            return False
+        if text.startswith("#"):
+            return True
+        if len(text) <= 90 and text.upper() == text and any(ch.isalpha() for ch in text):
+            return True
+        return False
 
-        with ZipFile(path, "r") as archive:
-            if "word/document.xml" not in archive.namelist():
-                return "", 0, 0
-            xml_bytes = archive.read("word/document.xml")
+    def _has_unit_hint(self, text: str) -> bool:
+        return bool(
+            re.search(
+                r"(?i)\b\d+(?:\.\d+)?\s*(?:g|kg|mg|ml|l|lb|lbs|#|oz|fl oz|qt|pt|gal|cup|cups|tbsp|tsp|cs|case|cases|ea|each|pcs)\b",
+                str(text or ""),
+            )
+        ) or bool(re.match(r"^\d+(?:\.\d+)?#", str(text or "").replace(" ", "")))
 
-        root = ET.fromstring(xml_bytes)
-        body = root.find("w:body", DOCX_NS)
-        if body is None:
-            return "", 0, 0
+    def _looks_like_recipe_boundary(self, line: str, next_lines: List[str]) -> bool:
+        text = str(line or "").strip()
+        if not text:
+            return False
+        if self._is_heading_line(text):
+            return False
+        if _is_ingredient_line(text):
+            return False
+        if text.endswith(":"):
+            return False
+        if len(text) < 3 or len(text) > 90:
+            return False
+        if sum(1 for ch in text if ch.isdigit()) > 0:
+            return False
+        if len(text.split()) > 8:
+            return False
+        if not any(ch.isalpha() for ch in text):
+            return False
 
-        paragraph_tag = f"{{{DOCX_NS['w']}}}p"
-        table_tag = f"{{{DOCX_NS['w']}}}tbl"
+        probe = [str(item or "").strip() for item in next_lines[:5] if str(item or "").strip()]
+        if not probe:
+            return False
+        if any(self._has_unit_hint(item) for item in probe):
+            return True
+        section_hits = {"ingredients", "base", "method", "grind and add", "finish", "for service"}
+        if any(_normalize_key(item.rstrip(":")) in section_hits for item in probe):
+            return True
+        return False
 
-        for child in list(body):
-            if child.tag == paragraph_tag:
-                paragraph_text = self._docx_paragraph_text(child)
-                if paragraph_text:
-                    lines.append(paragraph_text)
-                    paragraph_count += 1
+    def _split_restaurant_recipe_blocks(self, text: str, default_heading: str) -> List[Tuple[str, List[str]]]:
+        lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+        if not lines:
+            return []
+
+        blocks: List[Tuple[str, List[str]]] = []
+        current_heading = default_heading
+        current_lines: List[str] = []
+
+        for idx, line in enumerate(lines):
+            if self._looks_like_recipe_boundary(line, lines[idx + 1 :]):
+                if current_lines:
+                    blocks.append((current_heading, current_lines))
+                    current_lines = []
+                current_heading = line
+                current_lines = [line]
                 continue
+            current_lines.append(line)
 
-            if child.tag != table_tag:
+        if current_lines:
+            blocks.append((current_heading, current_lines))
+
+        # Merge heading-only fragments into the next block so chunks carry actual body content.
+        merged: List[Tuple[str, List[str]]] = []
+        idx = 0
+        section_markers = {"ingredients", "base", "method", "grind and add", "finish", "for service", "ratio"}
+        while idx < len(blocks):
+            heading, body_lines = blocks[idx]
+            payload = False
+            for candidate in body_lines[1:]:
+                norm = _normalize_key(str(candidate).rstrip(":"))
+                if self._has_unit_hint(candidate) or norm in section_markers or STEP_LINE_RE.match(str(candidate)):
+                    payload = True
+                    break
+            if not payload and idx + 1 < len(blocks):
+                next_heading, next_body = blocks[idx + 1]
+                blocks[idx + 1] = (next_heading, [*body_lines, *next_body])
+                idx += 1
                 continue
+            merged.append((heading, body_lines))
+            idx += 1
 
-            for row_index, row in enumerate(child.findall("w:tr", DOCX_NS), start=1):
-                row_cells: List[str] = []
-                for cell in row.findall("w:tc", DOCX_NS):
-                    cell_paragraphs: List[str] = []
-                    for paragraph in cell.findall(".//w:p", DOCX_NS):
-                        paragraph_text = self._docx_paragraph_text(paragraph)
-                        if paragraph_text:
-                            cell_paragraphs.append(paragraph_text)
-                    row_cells.append(" ".join(cell_paragraphs).strip())
+        if len(merged) <= 1:
+            return []
+        return merged
 
-                populated_cells = [cell for cell in row_cells if cell]
-                if populated_cells:
-                    row_text = " | ".join(populated_cells)
-                    lines.append(f"TABLE ROW {row_index}: {row_text}")
-                    table_row_count += 1
-
-        normalized_lines = [" ".join(line.split()) for line in lines if " ".join(line.split())]
-        return "\n".join(normalized_lines), paragraph_count, table_row_count
+    def _derive_text_profile_label(
+        self,
+        *,
+        extracted_text_chars: int,
+        extracted_from_tables_chars: int,
+        extracted_from_paragraphs_chars: int,
+        image_rich: bool,
+    ) -> str:
+        if image_rich:
+            return "IMAGE-RICH"
+        if int(extracted_text_chars) >= 20000:
+            return "TEXT-RICH"
+        if int(extracted_from_tables_chars) > int(extracted_from_paragraphs_chars) and int(extracted_from_tables_chars) > 0:
+            return "TABLES-ONLY"
+        return "LOW TEXT"
 
     def _chunk_text_blocks(
         self,
         text: str,
         heading: str = "General",
-        target_size: int = 900,
-        overlap_lines: int = 2,
+        chunk_size_chars: int = 3500,
+        chunk_overlap_chars: int = 400,
+        minimum_chunk_chars: int = 400,
+        merge_short_chunks: bool = True,
+        pre_sections: Optional[List[Tuple[str, List[str]]]] = None,
     ) -> List[Dict[str, str]]:
-        lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-        if not lines:
-            return []
+        sections: List[Tuple[str, List[str]]] = []
+        if pre_sections:
+            sections = [(str(h or heading), [str(line or "").strip() for line in body if str(line or "").strip()]) for h, body in pre_sections]
+        else:
+            lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+            if not lines:
+                return []
+
+            current_heading = heading
+            current_lines: List[str] = []
+            for line in lines:
+                if self._is_heading_line(line):
+                    if current_lines:
+                        sections.append((current_heading, current_lines))
+                        current_lines = []
+                    current_heading = line.lstrip("#").strip() or heading
+                    continue
+                current_lines.append(line)
+            if current_lines:
+                sections.append((current_heading, current_lines))
+            if not sections:
+                sections = [(heading, lines)]
 
         chunks: List[Dict[str, str]] = []
-        current_lines: List[str] = []
-        current_length = 0
+        stride = max(200, int(chunk_size_chars) - int(chunk_overlap_chars))
+        for sec_heading, body_lines in sections:
+            body = "\n".join(body_lines).strip()
+            if not body:
+                continue
+            prefix = f"## {sec_heading}\n"
+            if len(body) + len(prefix) <= chunk_size_chars:
+                chunks.append({"text": f"{prefix}{body}".strip(), "heading": sec_heading})
+                continue
 
-        for line in lines:
-            line_length = len(line) + 1
-            if current_lines and current_length + line_length > target_size:
-                chunks.append({"text": "\n".join(current_lines), "heading": heading})
-                overlap = current_lines[-overlap_lines:] if overlap_lines > 0 else []
-                current_lines = list(overlap)
-                current_length = sum(len(value) + 1 for value in current_lines)
+            start = 0
+            while start < len(body):
+                end = min(len(body), start + int(chunk_size_chars) - len(prefix))
+                slice_text = body[start:end].strip()
+                if not slice_text:
+                    break
+                chunks.append({"text": f"{prefix}{slice_text}".strip(), "heading": sec_heading})
+                if end >= len(body):
+                    break
+                start += stride
 
-            current_lines.append(line)
-            current_length += line_length
+        if not chunks:
+            return []
 
-        if current_lines:
-            chunks.append({"text": "\n".join(current_lines), "heading": heading})
+        if not merge_short_chunks:
+            return [{"text": str(chunk.get("text") or "").strip(), "heading": str(chunk.get("heading") or heading)} for chunk in chunks]
 
-        # Safety split to avoid giant single-chunk ingestion for non-tiny documents.
-        if len(chunks) == 1:
-            compact_text = " ".join(lines)
-            if len(compact_text) > target_size * 2:
-                words = compact_text.split()
-                midpoint = len(words) // 2
-                first = " ".join(words[:midpoint]).strip()
-                second = " ".join(words[midpoint:]).strip()
-                if first and second:
-                    chunks = [
-                        {"text": first, "heading": heading},
-                        {"text": second, "heading": heading},
-                    ]
+        merged: List[Dict[str, str]] = []
+        for chunk in chunks:
+            text_value = str(chunk.get("text") or "").strip()
+            if not text_value:
+                continue
+            if merged and len(text_value) < int(minimum_chunk_chars):
+                merged[-1]["text"] = f"{merged[-1]['text']}\n{text_value}".strip()
+                continue
+            merged.append({"text": text_value, "heading": str(chunk.get("heading") or heading)})
 
-        return chunks
+        return merged
+
+    def _apply_chunk_dedupe(
+        self,
+        chunks_data: List[Dict[str, Any]],
+        *,
+        dedupe_enabled: bool,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
+        warnings: List[str] = []
+        repeated: Dict[str, int] = {}
+        pre_count = len(chunks_data)
+        if not dedupe_enabled or pre_count <= 1:
+            return (
+                chunks_data,
+                {
+                    "dedupe_enabled": bool(dedupe_enabled),
+                    "pre_dedupe_count": pre_count,
+                    "post_dedupe_count": pre_count,
+                    "dedupe_key_strategy": "sha256(normalized_chunk_text)",
+                    "top_repeated_hashes": [],
+                },
+                warnings,
+            )
+
+        deduped: List[Dict[str, Any]] = []
+        seen: Dict[str, int] = {}
+        for item in chunks_data:
+            raw_text = str(item.get("text") or "")
+            normalized = " ".join(raw_text.split())
+            if not normalized:
+                continue
+            dedupe_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+            if dedupe_hash in seen:
+                repeated[dedupe_hash] = repeated.get(dedupe_hash, 1) + 1
+                continue
+            seen[dedupe_hash] = 1
+            deduped.append(item)
+
+        post_count = len(deduped)
+        if pre_count > 0 and post_count < (0.3 * pre_count):
+            warnings.append(
+                f"dedupe_collapse: pre_dedupe_count={pre_count} post_dedupe_count={post_count} strategy=sha256(normalized_chunk_text)"
+            )
+
+        top_repeated = sorted(repeated.items(), key=lambda pair: pair[1], reverse=True)[:5]
+        return (
+            deduped,
+            {
+                "dedupe_enabled": True,
+                "pre_dedupe_count": pre_count,
+                "post_dedupe_count": post_count,
+                "dedupe_key_strategy": "sha256(normalized_chunk_text)",
+                "top_repeated_hashes": [{"hash": key, "count": count} for key, count in top_repeated],
+            },
+            warnings,
+        )
+
+    def _infer_chunk_recipe_metadata(self, text: str, chunk_index: int) -> Dict[str, Any]:
+        entries = _parse_recipe_entries_from_chunk(text=text, chunk_id=chunk_index)
+        if not entries:
+            return {"recipe_name": "", "section_name": "", "order_index": int(chunk_index)}
+        first = entries[0]
+        return {
+            "recipe_name": str(first.get("recipe_name") or ""),
+            "section_name": str(first.get("section_name") or ""),
+            "order_index": int(chunk_index),
+        }
+
+    def _fetch_source_chunks(self, source_name: str) -> List[Dict[str, Any]]:
+        try:
+            payload = self.collection.get(
+                where={"source": source_name},
+                include=["documents", "metadatas"],
+            )
+        except Exception:
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        ids = payload.get("ids") or []
+        docs = payload.get("documents") or []
+        metas = payload.get("metadatas") or []
+        for idx in range(len(ids)):
+            meta = metas[idx] if idx < len(metas) else {}
+            try:
+                chunk_id = int((meta or {}).get("chunk_id", idx))
+            except Exception:
+                chunk_id = idx
+            rows.append(
+                {
+                    "chunk_id": chunk_id,
+                    "content": str(docs[idx] if idx < len(docs) else ""),
+                    "metadata": meta or {},
+                }
+            )
+
+        rows.sort(key=lambda item: int(item.get("chunk_id", 0)))
+        return rows
+
+    def _assemble_house_recipe_from_source(
+        self,
+        *,
+        query_text: str,
+        source_name: str,
+        source_title: str,
+        confidence_threshold: float,
+    ) -> Dict[str, Any]:
+        chunks = self._fetch_source_chunks(source_name=source_name)
+        if not chunks:
+            return {
+                "status": "not_found",
+                "query": query_text,
+                "source_name": source_name,
+                "source_title": source_title,
+                "reason": "source_chunks_empty",
+            }
+
+        entries: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            entries.extend(
+                _parse_recipe_entries_from_chunk(
+                    text=str(chunk.get("content") or ""),
+                    chunk_id=int(chunk.get("chunk_id", 0)),
+                )
+            )
+
+        if not entries:
+            return {
+                "status": "incomplete",
+                "query": query_text,
+                "source_name": source_name,
+                "source_title": source_title,
+                "reason": "extraction_empty",
+                "chunks_used": 0,
+                "sections_detected": [],
+                "missing_sections": ["ingredients", "method"],
+                "confidence": 0.0,
+            }
+
+        target = _normalize_recipe_query_target(query_text) or str(query_text or "").strip()
+        candidate_names = sorted({str(entry.get("recipe_name") or "").strip() for entry in entries if entry.get("recipe_name")})
+        if not candidate_names:
+            return {
+                "status": "incomplete",
+                "query": query_text,
+                "source_name": source_name,
+                "source_title": source_title,
+                "reason": "no_recipe_titles",
+                "chunks_used": 0,
+                "sections_detected": [],
+                "missing_sections": ["ingredients", "method"],
+                "confidence": 0.0,
+            }
+
+        best_name = ""
+        best_score = 0.0
+        for candidate in candidate_names:
+            score = _title_match_score(target=target, candidate=candidate)
+            if score > best_score:
+                best_name = candidate
+                best_score = score
+
+        if best_score < 0.55:
+            return {
+                "status": "not_found",
+                "query": query_text,
+                "source_name": source_name,
+                "source_title": source_title,
+                "reason": "low_title_match",
+                "confidence": float(best_score),
+            }
+
+        selected = [
+            entry
+            for entry in entries
+            if _normalize_key(str(entry.get("recipe_name") or "")) == _normalize_key(best_name)
+        ]
+        selected.sort(key=lambda item: (int(item.get("chunk_id", 0)), int(item.get("order_index", 0))))
+
+        section_order: List[str] = []
+        section_lines: Dict[str, List[Tuple[str, str]]] = {}
+        for entry in selected:
+            section = str(entry.get("section_name") or "Base").strip() or "Base"
+            if section not in section_lines:
+                section_lines[section] = []
+                section_order.append(section)
+            line = str(entry.get("line") or "").strip()
+            kind = str(entry.get("kind") or "ingredient")
+            if not line:
+                continue
+            if section_lines[section] and section_lines[section][-1][0].lower() == line.lower():
+                continue
+            section_lines[section].append((line, kind))
+
+        ingredient_sections: List[Tuple[str, List[str]]] = []
+        method_lines: List[str] = []
+        for section in section_order:
+            values = section_lines.get(section, [])
+            if not values:
+                continue
+            section_key = _normalize_key(section)
+            if section_key in METHOD_SECTION_KEYS:
+                for line, _ in values:
+                    if line.lower() not in {item.lower() for item in method_lines}:
+                        method_lines.append(line)
+                continue
+
+            ingredients = [line for line, kind in values if kind == "ingredient"]
+            if ingredients:
+                ingredient_sections.append((section, ingredients))
+
+            narrative = [line for line, kind in values if kind != "ingredient"]
+            for line in narrative:
+                if line.lower() not in {item.lower() for item in method_lines}:
+                    method_lines.append(line)
+
+        if not method_lines:
+            for section, _ in ingredient_sections:
+                if _normalize_key(section) in ACTION_SECTION_KEYS:
+                    method_lines.append(section)
+                    break
+
+        missing_sections: List[str] = []
+        if not ingredient_sections:
+            missing_sections.append("ingredients")
+        if not method_lines:
+            missing_sections.append("method")
+
+        chunks_used = len({int(entry.get("chunk_id", 0)) for entry in selected})
+        sections_detected = [section for section, lines in ingredient_sections if lines]
+        if "Method" not in sections_detected and method_lines:
+            sections_detected.append("Method")
+
+        confidence = float(best_score)
+        if missing_sections or confidence < float(confidence_threshold):
+            return {
+                "status": "incomplete",
+                "query": query_text,
+                "source_name": source_name,
+                "source_title": source_title,
+                "matched_recipe_name": best_name,
+                "reason": "validation_failed" if missing_sections else "low_confidence",
+                "chunks_used": int(chunks_used),
+                "sections_detected": sections_detected,
+                "missing_sections": missing_sections or ["confidence"],
+                "confidence": confidence,
+            }
+
+        return {
+            "status": "ok",
+            "query": query_text,
+            "source_name": source_name,
+            "source_title": source_title,
+            "matched_recipe_name": best_name,
+            "chunks_used": int(chunks_used),
+            "sections_detected": sections_detected,
+            "missing_sections": [],
+            "confidence": confidence,
+            "html": _format_house_recipe_html(
+                recipe_name=best_name,
+                source_title=source_title or source_name,
+                ingredient_sections=ingredient_sections,
+                method_lines=method_lines,
+            ),
+        }
+
+    def assemble_house_recipe(
+        self,
+        *,
+        query_text: str,
+        n_results: int = 10,
+        confidence_threshold: float = 0.75,
+    ) -> Dict[str, Any]:
+        hits = self.search(
+            query_text=query_text,
+            n_results=max(5, int(n_results)),
+            source_tiers=[TIER_1_RECIPE_OPS],
+        )
+        if not hits:
+            return {
+                "status": "not_found",
+                "query": query_text,
+                "reason": "no_tier1_hits",
+            }
+
+        sources_meta = self._load_sources()
+        source_title_by_name = {
+            str(source.get("source_name") or ""): str(source.get("title") or source.get("source_name") or "")
+            for source in sources_meta
+        }
+
+        source_names: List[str] = []
+        for hit in hits:
+            source_name = str(hit.get("source") or "")
+            if source_name and source_name not in source_names:
+                source_names.append(source_name)
+
+        best_incomplete: Optional[Dict[str, Any]] = None
+        for source_name in source_names:
+            source_title = source_title_by_name.get(source_name, source_name)
+            assembled = self._assemble_house_recipe_from_source(
+                query_text=query_text,
+                source_name=source_name,
+                source_title=source_title,
+                confidence_threshold=confidence_threshold,
+            )
+            if assembled.get("status") == "ok":
+                return assembled
+            if assembled.get("status") == "incomplete":
+                if best_incomplete is None:
+                    best_incomplete = assembled
+                else:
+                    score_now = float(assembled.get("confidence", 0.0)) + float(assembled.get("chunks_used", 0))
+                    score_best = float(best_incomplete.get("confidence", 0.0)) + float(
+                        best_incomplete.get("chunks_used", 0)
+                    )
+                    if score_now > score_best:
+                        best_incomplete = assembled
+
+        if best_incomplete is not None:
+            return best_incomplete
+
+        return {
+            "status": "not_found",
+            "query": query_text,
+            "reason": "no_source_match",
+        }
+
+    def debug_house_recipe(
+        self,
+        *,
+        query_text: str,
+        n_results: int = 10,
+        confidence_threshold: float = 0.75,
+    ) -> Dict[str, Any]:
+        return self.assemble_house_recipe(
+            query_text=query_text,
+            n_results=n_results,
+            confidence_threshold=confidence_threshold,
+        )
 
     def get_sources(self) -> List[Dict[str, Any]]:
         return self._load_sources()
@@ -640,6 +1471,7 @@ class RAGEngine:
         file_path: str,
         extra_metadata: Optional[Dict[str, Any]] = None,
         ingestion_options: Optional[Dict[str, Any]] = None,
+        ingest_id: Optional[str] = None,
     ) -> Tuple[bool, Any]:
         """
         Ingestion pipeline:
@@ -656,9 +1488,26 @@ class RAGEngine:
         if not path.exists():
             return False, "File not found."
 
+        ingest_id = str(ingest_id or "").strip() or uuid.uuid4().hex
+        source_id = str(uuid.uuid4())
+        date_ingested = _iso_now()
+        file_sha256 = _sha256_file(path)
+        file_size = int(path.stat().st_size)
+
         settings = self._get_settings()
+        runtime_cfg = load_runtime_config()
+        debug_cfg = runtime_cfg.get("debug", {}) if isinstance(runtime_cfg, dict) else {}
         image_cfg = settings.get("image_processing", {})
         vision_cfg = settings.get("vision", {})
+        chunk_cfg = settings.get("chunking", {})
+        docx_cfg = settings.get("docx", {})
+
+        chunk_size_chars = int(chunk_cfg.get("chunk_size_chars", 3500))
+        chunk_overlap_chars = int(chunk_cfg.get("chunk_overlap_chars", 400))
+        minimum_chunk_chars = int(chunk_cfg.get("minimum_chunk_chars", 400))
+        dedupe_enabled = bool(chunk_cfg.get("dedupe_enabled", True))
+        image_only_text_threshold = int(docx_cfg.get("image_only_text_threshold", 5000))
+
         knowledge_tier = (
             normalize_knowledge_tier(extra_metadata.get("knowledge_tier"))
             or infer_knowledge_tier(
@@ -668,6 +1517,9 @@ class RAGEngine:
                 summary=extra_metadata.get("summary", ""),
             )
         )
+        source_type_raw = str(extra_metadata.get("source_type", "unknown"))
+        source_type = _map_doc_source_type(source_type_raw, knowledge_tier)
+        restaurant_tag = extra_metadata.get("restaurant_tag")
 
         options = {
             "extract_images": bool(image_cfg.get("extract_images", False)),
@@ -675,14 +1527,12 @@ class RAGEngine:
         }
         if ingestion_options:
             options.update({k: bool(v) for k, v in ingestion_options.items() if k in options})
-
-        # Vision descriptions require images to be extracted first.
         if options["vision_descriptions"]:
             options["extract_images"] = True
 
         is_pdf = path.suffix.lower() == ".pdf"
         is_docx = path.suffix.lower() == ".docx"
-        chunker = SmartChunker()
+        chunker = SmartChunker(target_size=chunk_size_chars, overlap=chunk_overlap_chars)
 
         warnings: List[str] = []
         pipeline = {
@@ -699,12 +1549,83 @@ class RAGEngine:
         ocr_required = False
         ocr_applied = False
         extracted_images: List[Dict[str, Any]] = []
+        extracted_text_chars = 0
 
-        source_id = str(uuid.uuid4())
-        date_ingested = __import__("datetime").datetime.now().isoformat()
+        report: Dict[str, Any] = {
+            "ingest_id": ingest_id,
+            "created_at": date_ingested,
+            "raw_document": {
+                "filename": path.name,
+                "file_extension": path.suffix.lower(),
+                "file_size_bytes": file_size,
+                "file_sha256": file_sha256,
+                "guessed_source_type": source_type,
+                "restaurant_tag": restaurant_tag,
+                "source_type_raw": source_type_raw,
+            },
+            "extraction_metrics": {
+                "extracted_text_chars": 0,
+                "extracted_text_lines": 0,
+                "docx_paragraph_count": 0,
+                "docx_table_count": 0,
+                "docx_table_cell_count": 0,
+                "extracted_from_tables_chars": 0,
+                "extracted_from_paragraphs_chars": 0,
+                "embedded_image_count": 0,
+                "warning_flags": {
+                    "text_too_short": False,
+                    "tables_present_but_empty_extraction": False,
+                    "likely_image_only": False,
+                },
+            },
+            "chunking_metrics": {
+                "chunk_size_config": chunk_size_chars,
+                "chunk_overlap_config": chunk_overlap_chars,
+                "minimum_chunk_chars": minimum_chunk_chars,
+                "produced_chunk_count": 0,
+                "avg_chunk_chars": 0.0,
+                "min_chunk_chars": 0,
+                "max_chunk_chars": 0,
+                "pre_dedupe_chunk_samples": [],
+            },
+            "dedupe_metrics": {
+                "dedupe_enabled": dedupe_enabled,
+                "pre_dedupe_count": 0,
+                "post_dedupe_count": 0,
+                "dedupe_key_strategy": "sha256(normalized_chunk_text)",
+                "top_repeated_hashes": [],
+            },
+            "vector_store_metrics": {
+                "attempted_add_count": 0,
+                "successfully_added_count": 0,
+                "collection_name": COLLECTION_NAME,
+                "metadata_fields_stored": [],
+                "error_count": 0,
+            },
+            "chunk_samples": [],
+            "warnings": warnings,
+            "status": "failed",
+        }
+
+        # Persist canonical source row immediately so ingest is visible while in progress.
+        self._persist_doc_source(
+            ingest_id=ingest_id,
+            filename=path.name,
+            source_type=source_type,
+            restaurant_tag=restaurant_tag,
+            file_sha256=file_sha256,
+            file_size=file_size,
+            extracted_text_chars=0,
+            chunk_count=0,
+            chunks_added=0,
+            status="queued",
+        )
 
         ocr_working_pdf = path
         temp_ocr_path: Optional[Path] = None
+        chunks_added = 0
+        chunks_final_count = 0
+        error_text: Optional[str] = None
 
         try:
             if is_pdf:
@@ -715,18 +1636,14 @@ class RAGEngine:
                 if ocr_required:
                     pipeline["ocr"] = "required"
                     if not bool(settings.get("ocr", {}).get("enabled", True)):
-                        return (
-                            False,
-                            (
-                                "Ingestion blocked: this PDF appears image-heavy and requires OCR before indexing. "
-                                f"Recommended preprocessing: ocrmypdf --skip-text '{path}' '{path.stem}_ocr.pdf'"
-                            ),
+                        raise RuntimeError(
+                            "Ingestion blocked: this PDF appears image-heavy and requires OCR before indexing."
                         )
 
                     temp_ocr_path = Path("data/tmp/ocr") / f"{path.stem}_{source_id[:8]}.pdf"
                     ok, error_msg = self._run_ocr(path, temp_ocr_path, settings["ocr"].get("tool", "ocrmypdf"))
                     if not ok:
-                        return False, error_msg
+                        raise RuntimeError(error_msg)
 
                     ocr_working_pdf = temp_ocr_path
                     ocr_applied = True
@@ -741,91 +1658,98 @@ class RAGEngine:
             chunks_data: List[Dict[str, Any]] = []
             if is_pdf:
                 chunks = chunker.chunk_pdf(ocr_working_pdf)
-                chunks_data = [
-                    {
-                        "text": chunk["text"],
-                        "heading": chunk["heading"],
-                        "kind": "text",
-                    }
-                    for chunk in chunks
-                ]
+                chunks_data = [{"text": chunk["text"], "heading": chunk["heading"], "kind": "text"} for chunk in chunks]
+                extracted_text_chars = int(sum(len(chunk["text"]) for chunk in chunks_data))
+                report["extraction_metrics"]["extracted_text_chars"] = extracted_text_chars
+                report["extraction_metrics"]["extracted_text_lines"] = int(
+                    sum(chunk["text"].count("\n") + 1 for chunk in chunks_data)
+                )
             elif is_docx:
-                extracted_text, paragraph_count, table_row_count = self._extract_docx_text(path)
-                logger.info(
-                    "DOCX extraction: file=%s raw_text_chars=%s paragraphs=%s table_rows=%s",
-                    path.name,
-                    len(extracted_text),
-                    paragraph_count,
-                    table_row_count,
+                extracted_text, metrics = extract_text(str(path))
+                extracted_text_chars = len(extracted_text)
+                report["extraction_metrics"].update(metrics)
+                report["extraction_metrics"]["extracted_text_chars"] = extracted_text_chars
+                report["extraction_metrics"]["extracted_text_lines"] = len([line for line in extracted_text.splitlines() if line.strip()])
+
+                embedded_image_count = int(metrics.get("embedded_image_count", detect_images_in_docx(str(path))))
+                tables_present_but_empty = int(metrics.get("docx_table_count", 0)) > 0 and int(
+                    metrics.get("extracted_from_tables_chars", 0)
+                ) == 0
+                likely_image_only = embedded_image_count > 0 and extracted_text_chars < image_only_text_threshold
+                text_too_short = extracted_text_chars < image_only_text_threshold
+                report["extraction_metrics"]["warning_flags"] = {
+                    "text_too_short": bool(text_too_short),
+                    "tables_present_but_empty_extraction": bool(tables_present_but_empty),
+                    "likely_image_only": bool(likely_image_only),
+                }
+                if tables_present_but_empty:
+                    warnings.append("tables_present_but_empty_extraction: docx_table_count>0 but extracted_from_tables_chars=0")
+                if text_too_short:
+                    warnings.append(
+                        f"text_too_short: extracted_text_chars={extracted_text_chars} threshold={image_only_text_threshold}"
+                    )
+                if likely_image_only:
+                    warnings.append(
+                        f"likely_image_only: embedded_image_count={embedded_image_count} extracted_text_chars={extracted_text_chars}"
+                    )
+
+                if source_type == "restaurant_recipes" and (likely_image_only or (text_too_short and embedded_image_count > 0)):
+                    ocr_text, ocr_images, ocr_warnings = self._ocr_docx_images(path, ingest_id)
+                    warnings.extend(ocr_warnings)
+                    if ocr_text:
+                        ocr_applied = True
+                        pipeline["ocr"] = "applied_docx_images"
+                        extracted_text = f"{extracted_text}\n\n# OCR Fallback\n{ocr_text}".strip()
+                        extracted_text_chars = len(extracted_text)
+                        report["extraction_metrics"]["embedded_image_count"] = embedded_image_count
+                        report["extraction_metrics"]["extracted_text_chars"] = extracted_text_chars
+                        report["extraction_metrics"]["extracted_text_lines"] = len(
+                            [line for line in extracted_text.splitlines() if line.strip()]
+                        )
+                        report["extraction_metrics"]["ocr_images_processed"] = int(ocr_images)
+                        report["extraction_metrics"]["ocr_fallback_chars"] = len(ocr_text)
+                    else:
+                        warnings.append("docx_ocr_fallback_no_text: OCR produced no usable text")
+
+                recipe_sections = (
+                    self._split_restaurant_recipe_blocks(extracted_text, "DOCX Content")
+                    if source_type == "restaurant_recipes"
+                    else []
                 )
                 text_chunks = self._chunk_text_blocks(
                     extracted_text,
                     heading="DOCX Content",
-                    target_size=900,
-                    overlap_lines=2,
+                    chunk_size_chars=chunk_size_chars,
+                    chunk_overlap_chars=chunk_overlap_chars,
+                    minimum_chunk_chars=120 if source_type == "restaurant_recipes" else minimum_chunk_chars,
+                    merge_short_chunks=False if source_type == "restaurant_recipes" else True,
+                    pre_sections=recipe_sections if recipe_sections else None,
                 )
-                logger.info("DOCX chunking: file=%s chunks_created=%s", path.name, len(text_chunks))
-                chunks_data = [
-                    {
-                        "text": chunk["text"],
-                        "heading": chunk["heading"],
-                        "kind": "text",
-                    }
-                    for chunk in text_chunks
-                ]
+                chunks_data = [{"text": chunk["text"], "heading": chunk["heading"], "kind": "text"} for chunk in text_chunks]
             else:
-                text = path.read_text(errors="replace")
+                text = path.read_text(encoding="utf-8", errors="replace")
+                extracted_text_chars = len(text)
+                report["extraction_metrics"]["extracted_text_chars"] = extracted_text_chars
+                report["extraction_metrics"]["extracted_text_lines"] = len([line for line in text.splitlines() if line.strip()])
+                report["extraction_metrics"]["extracted_from_paragraphs_chars"] = extracted_text_chars
                 text_chunks = self._chunk_text_blocks(
                     text,
                     heading="General",
-                    target_size=1000,
-                    overlap_lines=2,
+                    chunk_size_chars=chunk_size_chars,
+                    chunk_overlap_chars=chunk_overlap_chars,
+                    minimum_chunk_chars=minimum_chunk_chars,
                 )
-                chunks_data = [
-                    {
-                        "text": chunk["text"],
-                        "heading": chunk["heading"],
-                        "kind": "text",
-                    }
-                    for chunk in text_chunks
-                ]
+                chunks_data = [{"text": chunk["text"], "heading": chunk["heading"], "kind": "text"} for chunk in text_chunks]
 
             if not chunks_data:
-                return (
-                    False,
-                    (
-                        "Extraction yielded no text. For scanned/image-heavy PDFs, OCR is mandatory. "
-                        f"Recommended preprocessing: ocrmypdf --skip-text '{path}' '{path.stem}_ocr.pdf'"
-                    ),
-                )
-
-            total_chars = sum(len(chunk["text"]) for chunk in chunks_data)
-            if total_chars < 100:
-                if is_pdf and (image_rich or ocr_required):
-                    if not ocr_applied:
-                        return (
-                            False,
-                            (
-                                "Ingestion blocked: most content appears image-based and OCR was not applied. "
-                                f"Run: ocrmypdf --skip-text '{path}' '{path.stem}_ocr.pdf'"
-                            ),
-                        )
-
-                    return (
-                        False,
-                        (
-                            "OCR ran but extracted too little text to index safely. "
-                            "Please verify OCR output quality before ingesting."
-                        ),
-                    )
-                return False, f"Extracted only {total_chars} characters. Ingestion aborted."
+                raise RuntimeError("Extraction yielded no text chunks.")
 
             if is_pdf and options["extract_images"]:
                 pipeline["image_extraction"] = "applied"
                 max_images = int(image_cfg.get("max_images", 30))
                 extracted_images = self._extract_pdf_images(ocr_working_pdf, source_id, max_images=max_images)
                 if not extracted_images:
-                    warnings.append("Image extraction enabled, but no extractable images were found.")
+                    warnings.append("image_extraction_enabled_but_none_found")
 
             if is_pdf and options["vision_descriptions"]:
                 pipeline["vision_descriptions"] = "applied"
@@ -833,30 +1757,83 @@ class RAGEngine:
                 chunks_data.extend(vision_chunks)
                 warnings.extend(vision_warnings)
 
+            pre_lengths = [len(str(item.get("text") or "")) for item in chunks_data if str(item.get("text") or "").strip()]
+            produced_chunk_count = len(pre_lengths)
+            report["chunking_metrics"].update(
+                {
+                    "produced_chunk_count": produced_chunk_count,
+                    "avg_chunk_chars": round(sum(pre_lengths) / produced_chunk_count, 2) if produced_chunk_count else 0.0,
+                    "min_chunk_chars": min(pre_lengths) if pre_lengths else 0,
+                    "max_chunk_chars": max(pre_lengths) if pre_lengths else 0,
+                    "pre_dedupe_chunk_samples": [
+                        {
+                            "chunk_id": idx,
+                            "heading": str(item.get("heading") or "General"),
+                            "text_preview": str(item.get("text") or "")[:300],
+                        }
+                        for idx, item in enumerate(chunks_data[:3])
+                    ],
+                }
+            )
+            if extracted_text_chars < 5000:
+                warnings.append(f"low_text_extracted: extracted_text_chars={extracted_text_chars}")
+            elif extracted_text_chars >= 20000 and produced_chunk_count < 20:
+                if chunk_size_chars >= 10000:
+                    warnings.append(
+                        f"low_chunk_count: chunk_size too large ({chunk_size_chars} chars) for extracted_text_chars={extracted_text_chars}"
+                    )
+                else:
+                    warnings.append(
+                        f"low_chunk_count: extracted_text_chars={extracted_text_chars} produced_chunk_count={produced_chunk_count}"
+                    )
+
+            chunks_data, dedupe_metrics, dedupe_warnings = self._apply_chunk_dedupe(
+                chunks_data,
+                dedupe_enabled=dedupe_enabled,
+            )
+            warnings.extend(dedupe_warnings)
+            report["dedupe_metrics"] = dedupe_metrics
+            chunks_final_count = len(chunks_data)
+
+            total_chars = int(sum(len(str(chunk.get("text") or "")) for chunk in chunks_data))
+            if total_chars < 100:
+                if is_pdf and (image_rich or ocr_required):
+                    if not ocr_applied:
+                        raise RuntimeError(
+                            "Ingestion blocked: most content appears image-based and OCR was not applied."
+                        )
+                    raise RuntimeError("OCR ran but extracted too little text to index safely.")
+                raise RuntimeError(f"Extracted only {total_chars} characters. Ingestion aborted.")
+
             ids: List[str] = []
             metadatas: List[Dict[str, Any]] = []
             documents: List[str] = []
-
             for i, item in enumerate(chunks_data):
                 chunk_id = f"{path.name}_{i}_{source_id[:8]}"
+                recipe_meta = self._infer_chunk_recipe_metadata(str(item.get("text") or ""), i)
                 ids.append(chunk_id)
-                documents.append(item["text"])
-
+                documents.append(str(item.get("text") or ""))
                 metadatas.append(
                     {
                         "source": path.name,
                         "chunk_id": i,
                         "date_ingested": date_ingested,
-                        "source_type": extra_metadata.get("source_type", "document"),
+                        "source_type": source_type_raw,
                         "source_title": extra_metadata.get("source_title", path.stem),
                         "heading": item.get("heading", "General"),
                         "chunk_kind": item.get("kind", "text"),
                         "ocr_applied": bool(ocr_applied),
                         "knowledge_tier": knowledge_tier,
+                        "doc_source_type": source_type,
+                        "ingest_id": ingest_id,
+                        "recipe_name": recipe_meta.get("recipe_name", ""),
+                        "section_name": recipe_meta.get("section_name", ""),
+                        "order_index": int(recipe_meta.get("order_index", i)),
                     }
                 )
 
-            pipeline["chunking_embeddings"] = "applied"
+            report["vector_store_metrics"]["attempted_add_count"] = len(documents)
+            report["vector_store_metrics"]["metadata_fields_stored"] = list(metadatas[0].keys()) if metadatas else []
 
             try:
                 self.collection.delete(where={"source": path.name})
@@ -864,28 +1841,38 @@ class RAGEngine:
                 pass
 
             self.collection.add(documents=documents, metadatas=metadatas, ids=ids)
+            chunks_added = len(documents)
+            report["vector_store_metrics"]["successfully_added_count"] = chunks_added
+            pipeline["chunking_embeddings"] = "applied"
 
             sources = self._load_sources()
             sources = [source for source in sources if source["source_name"] != path.name]
 
-            extracted_image_dir = (
-                str((Path("data/extracted_images") / source_id).resolve()) if extracted_images else ""
+            extracted_image_dir = str((Path("data/extracted_images") / source_id).resolve()) if extracted_images else ""
+            extracted_from_tables_chars = int(report["extraction_metrics"].get("extracted_from_tables_chars", 0))
+            extracted_from_paragraphs_chars = int(report["extraction_metrics"].get("extracted_from_paragraphs_chars", 0))
+            text_profile = self._derive_text_profile_label(
+                extracted_text_chars=int(extracted_text_chars),
+                extracted_from_tables_chars=extracted_from_tables_chars,
+                extracted_from_paragraphs_chars=extracted_from_paragraphs_chars,
+                image_rich=bool(image_rich),
             )
-
             new_source = {
                 "id": source_id,
+                "ingest_id": ingest_id,
                 "source_name": path.name,
                 "collection_name": COLLECTION_NAME,
                 "title": extra_metadata.get("source_title", path.stem),
-                "type": extra_metadata.get("source_type", "document"),
+                "type": source_type_raw,
                 "knowledge_tier": knowledge_tier,
+                "doc_source_type": source_type,
                 "date_ingested": date_ingested,
                 "chunk_count": len(documents),
                 "status": "active",
                 "summary": extra_metadata.get("summary", "No summary provided."),
                 "ocr_required": bool(ocr_required),
                 "ocr_applied": bool(ocr_applied),
-                "ocr_tool": settings["ocr"].get("tool", "ocrmypdf") if is_pdf else "",
+                "ocr_tool": settings["ocr"].get("tool", "ocrmypdf") if is_pdf else "tesseract",
                 "image_rich": bool(image_rich),
                 "image_count": int(profile_before.get("image_count", 0)),
                 "page_count": int(profile_before.get("page_count", 0)),
@@ -895,9 +1882,16 @@ class RAGEngine:
                 "images_extracted": len(extracted_images),
                 "extracted_image_dir": extracted_image_dir,
                 "vision_descriptions_enabled": bool(options["vision_descriptions"]),
-                "vision_descriptions_count": len(
-                    [chunk for chunk in chunks_data if chunk.get("kind") == "vision"]
-                ),
+                "vision_descriptions_count": len([chunk for chunk in chunks_data if chunk.get("kind") == "vision"]),
+                "extracted_text_chars": int(extracted_text_chars),
+                "extracted_text_lines": int(report["extraction_metrics"].get("extracted_text_lines", 0)),
+                "docx_paragraph_count": int(report["extraction_metrics"].get("docx_paragraph_count", 0)),
+                "docx_table_count": int(report["extraction_metrics"].get("docx_table_count", 0)),
+                "docx_table_cell_count": int(report["extraction_metrics"].get("docx_table_cell_count", 0)),
+                "extracted_from_tables_chars": extracted_from_tables_chars,
+                "extracted_from_paragraphs_chars": extracted_from_paragraphs_chars,
+                "embedded_image_count": int(report["extraction_metrics"].get("embedded_image_count", 0)),
+                "text_profile_label": text_profile,
                 "ingestion_pipeline": pipeline,
                 "warnings": warnings,
                 "ingestion_complete": True,
@@ -905,10 +1899,38 @@ class RAGEngine:
             sources.append(new_source)
             self._save_sources(sources)
 
-            result = {
+            sample_limit = 10 if bool(debug_cfg.get("ingest_report", False)) else 3
+            report["chunk_samples"] = [
+                {
+                    "chunk_id": idx,
+                    "heading": str(item.get("heading") or "General"),
+                    "text_preview": str(item.get("text") or "")[:320],
+                }
+                for idx, item in enumerate(chunks_data[:sample_limit])
+            ]
+
+            status = "warn" if warnings else "ok"
+            report["status"] = status
+            self._persist_doc_source(
+                ingest_id=ingest_id,
+                filename=path.name,
+                source_type=source_type,
+                restaurant_tag=restaurant_tag,
+                file_sha256=file_sha256,
+                file_size=file_size,
+                extracted_text_chars=extracted_text_chars,
+                chunk_count=chunks_final_count,
+                chunks_added=chunks_added,
+                status=status,
+            )
+            self._write_ingest_report(ingest_id, report)
+
+            return True, {
                 "num_chunks": len(documents),
                 "source_title": new_source["title"],
                 "date": date_ingested,
+                "ingest_id": ingest_id,
+                "source_id": source_id,
                 "ocr_required": new_source["ocr_required"],
                 "ocr_applied": new_source["ocr_applied"],
                 "image_rich": new_source["image_rich"],
@@ -917,11 +1939,27 @@ class RAGEngine:
                 "knowledge_tier": new_source["knowledge_tier"],
                 "warnings": warnings,
             }
-            return True, result
 
         except Exception as exc:
+            error_text = str(exc)
             logger.exception("Error ingesting %s", file_path)
-            return False, str(exc)
+            report["status"] = "failed"
+            report["error"] = error_text
+            report["vector_store_metrics"]["error_count"] = int(report["vector_store_metrics"].get("error_count", 0)) + 1
+            self._persist_doc_source(
+                ingest_id=ingest_id,
+                filename=path.name,
+                source_type=source_type,
+                restaurant_tag=restaurant_tag,
+                file_sha256=file_sha256,
+                file_size=file_size,
+                extracted_text_chars=extracted_text_chars,
+                chunk_count=chunks_final_count,
+                chunks_added=chunks_added,
+                status="failed",
+            )
+            self._write_ingest_report(ingest_id, report)
+            return False, error_text
 
         finally:
             if temp_ocr_path and temp_ocr_path.exists():
@@ -1025,6 +2063,13 @@ class RAGEngine:
                             "source": metadata.get("source", "unknown"),
                             "heading": metadata.get("heading", ""),
                             "distance": distance if distance is not None else 0,
+                            "chunk_id": metadata.get("chunk_id", i),
+                            "ingest_id": metadata.get("ingest_id", ""),
+                            "source_title": metadata.get("source_title", ""),
+                            "doc_source_type": metadata.get("doc_source_type", ""),
+                            "recipe_name": metadata.get("recipe_name", ""),
+                            "section_name": metadata.get("section_name", ""),
+                            "order_index": metadata.get("order_index", metadata.get("chunk_id", i)),
                             "knowledge_tier": metadata.get(
                                 "knowledge_tier",
                                 source_tier_by_name.get(metadata.get("source", ""), TIER_1_RECIPE_OPS),

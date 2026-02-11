@@ -1,4 +1,3 @@
-import yaml
 import sys
 import os
 import signal
@@ -6,8 +5,9 @@ import subprocess
 import time
 from pathlib import Path
 import streamlit as st
+from services.command_runner import CommandRunner
+from prep_brain.config import get_log_path, get_pid_path, load_config as pb_load_config
 
-# Paths
 BASE_DIR = Path(__file__).parent.parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 
@@ -41,23 +41,22 @@ Output style:
 - Default to concise, structured answers.
 - Use bullets, tables, or steps when helpful."""
 
+COMMAND_RUNNER = CommandRunner()
+
 def load_config():
-    if not CONFIG_PATH.exists():
-        return {}
-    with open(CONFIG_PATH, "r") as f:
-        return yaml.safe_load(f)
+    return pb_load_config()
 
 def save_config(config):
+    import yaml
+
     with open(CONFIG_PATH, "w") as f:
         yaml.dump(config, f)
 
 def get_pid_file():
-    config = load_config()
-    return Path(config.get("paths", {}).get("pid_file", "run/prep-brain.pid"))
+    return get_pid_path(load_config())
 
 def get_log_file():
-    config = load_config()
-    return Path(config.get("paths", {}).get("log_file", "logs/prep-brain.log"))
+    return get_log_path(load_config())
 
 def get_bot_status():
     pid_file = get_pid_file()
@@ -85,7 +84,7 @@ def start_bot():
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [sys.executable, "-m", "services.bot"]
+    cmd = [sys.executable, "-m", "prep_brain.app"]
     
     with open(log_file, "a") as log:
         # Start detached process
@@ -146,9 +145,8 @@ def get_ollama_log_file():
 def get_ollama_status():
     # check if any process named "ollama" is running
     try:
-        # pgrep -x ollama or ollama serve
-        # -f to match full command line because "ollama serve" might be the command
-        result = subprocess.run(["pgrep", "-f", "ollama"], capture_output=True, text=True)
+        # -f matches full command line for "ollama serve".
+        result = COMMAND_RUNNER.run(["pgrep", "-f", "ollama"], capture_output=True, text=True)
         if result.returncode == 0:
             return "Running", "🟢"
         else:

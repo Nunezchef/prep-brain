@@ -1,9 +1,10 @@
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-import yaml
+from prep_brain.config import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -224,14 +225,6 @@ def _filter_component_results(query_text: str, results: List[Dict[str, Any]]) ->
         "heading_matched": heading_matched,
     }
     return ordered, debug
-
-
-def load_config() -> Dict[str, Any]:
-    try:
-        with open("config.yaml", "r") as f:
-            return yaml.safe_load(f) or {}
-    except Exception:
-        return {}
 
 
 def _truncate(text: str, limit: int = 220) -> str:
@@ -471,8 +464,8 @@ def _build_rag_reference_context(query_text: str, config: Dict[str, Any]) -> str
 def chat(messages: List[Tuple[str, str]]) -> str:
     config = load_config()
 
-    ollama_url = config.get("ollama", {}).get("base_url", "http://localhost:11434")
-    model = config.get("ollama", {}).get("model", "llama3.1:8b")
+    ollama_url = os.environ.get("OLLAMA_URL") or config.get("ollama", {}).get("base_url", "http://localhost:11434")
+    model = config.get("ollama", {}).get("model", "gpt-oss:20b")
     base_system_prompt = config.get("system_prompt", "You are a helpful assistant.")
     system_prompt = (
         f"{base_system_prompt.rstrip()}\n\n"
@@ -488,6 +481,36 @@ def chat(messages: List[Tuple[str, str]]) -> str:
 
     last_user_message: Optional[Tuple[str, str]] = next((m for m in reversed(messages) if m[0] == "user"), None)
     query_text = (last_user_message[1].strip() if last_user_message else "") if messages else ""
+
+    if rag_enabled and query_text and _is_recipe_query(query_text):
+        recipe_cfg = config.get("rag", {}).get("recipes", {}) if isinstance(config.get("rag", {}), dict) else {}
+        recipe_conf_threshold = float(recipe_cfg.get("completeness_confidence_threshold", 0.75))
+        try:
+            from services.rag import rag_engine
+
+            assembled = rag_engine.assemble_house_recipe(
+                query_text=query_text,
+                n_results=max(8, int(config.get("rag", {}).get("top_k", 3)) * 3),
+                confidence_threshold=recipe_conf_threshold,
+            )
+            status = str(assembled.get("status") or "").lower()
+            logger.info(
+                "House recipe assembly: status=%s query=%s source=%s recipe=%s chunks_used=%s sections=%s missing=%s confidence=%.3f",
+                status,
+                query_text,
+                assembled.get("source_name", ""),
+                assembled.get("matched_recipe_name", ""),
+                assembled.get("chunks_used", 0),
+                assembled.get("sections_detected", []),
+                assembled.get("missing_sections", []),
+                float(assembled.get("confidence", 0.0)),
+            )
+            if status == "ok" and assembled.get("html"):
+                return str(assembled["html"])
+            if status == "incomplete":
+                return "Recipe found but incomplete in source. Use /recipe <id> to review."
+        except Exception:
+            logger.exception("House recipe assembly failed for query=%s", query_text)
 
     payload_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
 
