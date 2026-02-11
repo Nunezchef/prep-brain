@@ -49,6 +49,7 @@ from services.memory import (
 from services.tg_format import tg_escape, tg_render_answer
 from services.transcriber import transcribe_file
 from prep_brain.config import load_config, resolve_path
+from prep_brain.ops import layer as ops_layer
 
 try:
     import fcntl  # type: ignore
@@ -1217,6 +1218,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data.pop(PENDING_INVOICE_VENDOR_KEY, None)
         if not result.get("ok"):
             await update.message.reply_text("Action required: vendor assignment failed.")
+        return
+
+    try:
+        ops_result = ops_layer.try_handle_text(update, context)
+    except Exception as exc:
+        logger.exception("OPS layer failed: %s", exc)
+        ops_result = None
+    if ops_result and ops_result.handled:
+        if ops_result.reply:
+            await update.message.reply_text(ops_result.reply)
         return
 
     handled_pending_ops = await _process_pending_ops_followup(update, context, text)
