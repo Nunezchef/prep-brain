@@ -29,6 +29,8 @@ def configure_logging(config: Optional[Dict[str, Any]] = None) -> None:
     stream.setFormatter(fmt)
     root.addHandler(stream)
 
-    file_handler = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    file_handler = RotatingFileHandler(
+        log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
