@@ -65,6 +65,30 @@ def _get_conn() -> sqlite3.Connection:
     return memory.get_conn()
 
 
+def _table_columns(con: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = con.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row[1]) for row in rows}
+
+
+def _recipes_has_station(con: sqlite3.Connection) -> bool:
+    return "station" in _table_columns(con, "recipes")
+
+
+def _station_expr(
+    con: sqlite3.Connection,
+    *,
+    recipe_alias: str = "r",
+    station_alias: Optional[str] = "st",
+) -> str:
+    if station_alias:
+        if _recipes_has_station(con):
+            return f"COALESCE({station_alias}.name, {recipe_alias}.station, 'Unassigned')"
+        return f"COALESCE({station_alias}.name, 'Unassigned')"
+    if _recipes_has_station(con):
+        return f"COALESCE({recipe_alias}.station, 'Unassigned')"
+    return "'Unassigned'"
+
+
 def _normalize_text(value: str) -> str:
     lowered = (value or "").lower()
     cleaned = re.sub(r"[^a-z0-9\s]+", " ", lowered)
@@ -152,7 +176,9 @@ def _ensure_station_id(con: sqlite3.Connection, station_name: str) -> Optional[i
     name = " ".join(str(station_name or "").split()).strip()
     if not name:
         return None
-    row = con.execute("SELECT id FROM stations WHERE LOWER(name) = LOWER(?) LIMIT 1", (name,)).fetchone()
+    row = con.execute(
+        "SELECT id FROM stations WHERE LOWER(name) = LOWER(?) LIMIT 1", (name,)
+    ).fetchone()
     if row:
         return int(row["id"])
     cur = con.execute("INSERT INTO stations (name, is_active) VALUES (?, 1)", (name,))
@@ -202,7 +228,9 @@ def _effective_status(
 ) -> str:
     if str(status or "").lower() == STATUS_DONE:
         return STATUS_DONE
-    if float(target_quantity or 0) > 0 and float(completed_quantity or 0) >= float(target_quantity or 0):
+    if float(target_quantity or 0) > 0 and float(completed_quantity or 0) >= float(
+        target_quantity or 0
+    ):
         return STATUS_DONE
     if float(completed_quantity or 0) > 0:
         return STATUS_IN_PROGRESS
@@ -271,8 +299,8 @@ def _resolve_recipe_for_update(
     station_hint: Optional[str],
 ) -> Dict[str, Any]:
     text_norm = _normalize_text(text)
-    rows = con.execute(
-        """
+    station_name_expr = _station_expr(con, recipe_alias="r", station_alias="st")
+    rows = con.execute(f"""
         SELECT
             pli.id,
             pli.recipe_id,
@@ -282,14 +310,13 @@ def _resolve_recipe_for_update(
             COALESCE(pli.status, 'todo') AS status,
             COALESCE(pli.hold_reason, '') AS hold_reason,
             r.name AS recipe_name,
-            COALESCE(st.name, r.station, 'Unassigned') AS station_name
+            {station_name_expr} AS station_name
         FROM prep_list_items pli
         JOIN recipes r ON r.id = pli.recipe_id
         LEFT JOIN stations st ON st.id = pli.station_id
         WHERE COALESCE(pli.status, 'todo') <> 'done'
         ORDER BY pli.id DESC
-        """
-    ).fetchall()
+        """).fetchall()
 
     if not rows:
         return {"ok": False, "reason": "no_open_items"}
@@ -392,7 +419,13 @@ def is_prep_update_text(text: str) -> bool:
     ):
         return False
     # Needs either a quantity hint, known phrasing, or "station ... done".
-    return bool(QTY_UNIT_RE.search(raw) or HALF_WORD_RE.search(raw) or REST_WORD_RE.search(raw) or "station" in raw or "done with" in raw)
+    return bool(
+        QTY_UNIT_RE.search(raw)
+        or HALF_WORD_RE.search(raw)
+        or REST_WORD_RE.search(raw)
+        or "station" in raw
+        or "done with" in raw
+    )
 
 
 def process_natural_update(
@@ -437,7 +470,11 @@ def process_natural_update(
             delta = float(qty_info["canonical_value"])
             delta_unit = str(qty_info["canonical_unit"])
             # Align to item canonical domain when target is known.
-            if remaining > 0 and delta_unit == "each" and str(item.get("display_unit") or "").lower() in {"qt", "quart", "quarts"}:
+            if (
+                remaining > 0
+                and delta_unit == "each"
+                and str(item.get("display_unit") or "").lower() in {"qt", "quart", "quarts"}
+            ):
                 # quantity unit mismatch; keep conservative and fail closed.
                 return {
                     "handled": True,
@@ -469,7 +506,27 @@ def process_natural_update(
         elif delta > 0 and display_unit:
             qty_display = _convert_canonical_to_display(
                 canonical_value=delta,
-                canonical_unit="ml" if display_unit in {"qt", "quart", "quarts", "pt", "pint", "pints", "gal", "gallon", "gallons", "l"} else ("each" if display_unit in PAN_LIKE_UNITS or display_unit in COUNT_LIKE_UNITS else "g"),
+                canonical_unit=(
+                    "ml"
+                    if display_unit
+                    in {
+                        "qt",
+                        "quart",
+                        "quarts",
+                        "pt",
+                        "pint",
+                        "pints",
+                        "gal",
+                        "gallon",
+                        "gallons",
+                        "l",
+                    }
+                    else (
+                        "each"
+                        if display_unit in PAN_LIKE_UNITS or display_unit in COUNT_LIKE_UNITS
+                        else "g"
+                    )
+                ),
                 display_unit=display_unit,
             )
         else:
@@ -494,14 +551,15 @@ def _resolve_recipe(con: sqlite3.Connection, recipe_name: str) -> Optional[Dict[
     name = " ".join(str(recipe_name or "").split()).strip()
     if not name:
         return None
+    station_select = "station" if _recipes_has_station(con) else "NULL AS station"
     exact = con.execute(
-        "SELECT id, name, yield_unit, station FROM recipes WHERE LOWER(name) = LOWER(?) LIMIT 1",
+        f"SELECT id, name, yield_unit, {station_select} FROM recipes WHERE LOWER(name) = LOWER(?) LIMIT 1",
         (name,),
     ).fetchone()
     if exact:
         return dict(exact)
     rows = con.execute(
-        "SELECT id, name, yield_unit, station FROM recipes WHERE LOWER(name) LIKE ? ORDER BY name LIMIT 20",
+        f"SELECT id, name, yield_unit, {station_select} FROM recipes WHERE LOWER(name) LIKE ? ORDER BY name LIMIT 20",
         (f"%{name.lower()}%",),
     ).fetchall()
     if not rows:
@@ -552,7 +610,9 @@ def add_item(
                 canonical_unit = "each"
             else:
                 try:
-                    normalized = normalize_quantity(qty, parse_unit, display_original=normalized_display)
+                    normalized = normalize_quantity(
+                        qty, parse_unit, display_original=normalized_display
+                    )
                     canonical_value = float(normalized["canonical_value"])
                     canonical_unit = str(normalized["canonical_unit"])
                     normalized_display = str(normalized["display_original"])
@@ -678,7 +738,9 @@ def assign_item(*, item_id: int, staff_name: str, actor: str) -> Dict[str, Any]:
     con = _get_conn()
     try:
         target = _normalize_text(staff_name)
-        rows = con.execute("SELECT id, name, role FROM staff WHERE is_active = 1 ORDER BY name").fetchall()
+        rows = con.execute(
+            "SELECT id, name, role FROM staff WHERE is_active = 1 ORDER BY name"
+        ).fetchall()
         if not rows:
             return {"ok": False, "error": "No active staff found."}
         scored: List[Tuple[float, sqlite3.Row]] = []
@@ -710,15 +772,18 @@ def assign_item(*, item_id: int, staff_name: str, actor: str) -> Dict[str, Any]:
         con.close()
 
 
-def get_items(*, station_name: Optional[str] = None, include_done: bool = True) -> List[Dict[str, Any]]:
+def get_items(
+    *, station_name: Optional[str] = None, include_done: bool = True
+) -> List[Dict[str, Any]]:
     con = _get_conn()
     try:
         params: List[Any] = []
         where_parts = ["1=1"]
+        station_name_expr = _station_expr(con, recipe_alias="r", station_alias="st")
         if not include_done:
             where_parts.append("COALESCE(pli.status, 'todo') <> 'done'")
         if station_name:
-            where_parts.append("LOWER(COALESCE(st.name, r.station, 'Unassigned')) = LOWER(?)")
+            where_parts.append(f"LOWER({station_name_expr}) = LOWER(?)")
             params.append(" ".join(station_name.split()))
         rows = con.execute(
             f"""
@@ -726,7 +791,7 @@ def get_items(*, station_name: Optional[str] = None, include_done: bool = True) 
                 pli.id,
                 pli.recipe_id,
                 r.name AS recipe_name,
-                COALESCE(st.name, r.station, 'Unassigned') AS station_name,
+                {station_name_expr} AS station_name,
                 pli.station_id,
                 COALESCE(pli.target_quantity, pli.need_quantity, 0) AS target_quantity,
                 COALESCE(pli.completed_quantity, 0) AS completed_quantity,
@@ -742,7 +807,7 @@ def get_items(*, station_name: Optional[str] = None, include_done: bool = True) 
             LEFT JOIN stations st ON st.id = pli.station_id
             LEFT JOIN staff s ON s.id = pli.assigned_staff_id
             WHERE {" AND ".join(where_parts)}
-            ORDER BY LOWER(COALESCE(st.name, r.station, 'Unassigned')), r.name, pli.id DESC
+            ORDER BY LOWER({station_name_expr}), r.name, pli.id DESC
             """,
             tuple(params),
         ).fetchall()
@@ -759,7 +824,28 @@ def get_items(*, station_name: Optional[str] = None, include_done: bool = True) 
             item["remaining_quantity"] = remaining
             item["remaining_display"] = _convert_canonical_to_display(
                 canonical_value=remaining,
-                canonical_unit="ml" if str(item.get("display_unit") or "").lower() in {"qt", "quart", "quarts", "pt", "pint", "pints", "gal", "gallon", "gallons", "l"} else ("each" if str(item.get("display_unit") or "").lower() in PAN_LIKE_UNITS or str(item.get("display_unit") or "").lower() in COUNT_LIKE_UNITS else "g"),
+                canonical_unit=(
+                    "ml"
+                    if str(item.get("display_unit") or "").lower()
+                    in {
+                        "qt",
+                        "quart",
+                        "quarts",
+                        "pt",
+                        "pint",
+                        "pints",
+                        "gal",
+                        "gallon",
+                        "gallons",
+                        "l",
+                    }
+                    else (
+                        "each"
+                        if str(item.get("display_unit") or "").lower() in PAN_LIKE_UNITS
+                        or str(item.get("display_unit") or "").lower() in COUNT_LIKE_UNITS
+                        else "g"
+                    )
+                ),
                 display_unit=str(item.get("display_unit") or ""),
             )
         return items
@@ -767,7 +853,9 @@ def get_items(*, station_name: Optional[str] = None, include_done: bool = True) 
         con.close()
 
 
-def grouped_by_station(*, station_name: Optional[str] = None, include_done: bool = True) -> List[Dict[str, Any]]:
+def grouped_by_station(
+    *, station_name: Optional[str] = None, include_done: bool = True
+) -> List[Dict[str, Any]]:
     items = get_items(station_name=station_name, include_done=include_done)
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for item in items:
@@ -812,22 +900,24 @@ def auto_generate_if_empty() -> Dict[str, Any]:
         if open_count > 0:
             return {"generated": 0, "open_count": open_count}
 
-        rows = con.execute(
-            """
-            SELECT r.id, r.name, r.station, COALESCE(r.par_level, 0) AS par_level,
+        recipe_station_expr = _station_expr(con, recipe_alias="r", station_alias=None)
+        rows = con.execute(f"""
+            SELECT r.id, r.name, {recipe_station_expr} AS station, COALESCE(r.par_level, 0) AS par_level,
                    COALESCE(r.yield_unit, 'each') AS yield_unit
             FROM recipes r
             WHERE r.is_active = 1 AND COALESCE(r.par_level, 0) > 0
             ORDER BY r.name
-            """
-        ).fetchall()
+            """).fetchall()
 
         generated = 0
         prefs = _station_unit_preferences()
         for row in rows:
             station_name = str(row["station"] or "Unassigned").strip() or "Unassigned"
             station_id = _ensure_station_id(con, station_name)
-            display_unit = prefs.get(_normalize_text(station_name)) or str(row["yield_unit"] or "each").strip().lower()
+            display_unit = (
+                prefs.get(_normalize_text(station_name))
+                or str(row["yield_unit"] or "each").strip().lower()
+            )
 
             par_level = float(row["par_level"] or 0.0)
             if par_level <= 0:
@@ -837,7 +927,11 @@ def auto_generate_if_empty() -> Dict[str, Any]:
             canonical_unit = "each"
             if display_unit not in PAN_LIKE_UNITS and display_unit not in COUNT_LIKE_UNITS:
                 try:
-                    normalized = normalize_quantity(par_level, MASS_VOLUME_UNITS.get(display_unit, display_unit), display_original=f"{par_level} {display_unit}")
+                    normalized = normalize_quantity(
+                        par_level,
+                        MASS_VOLUME_UNITS.get(display_unit, display_unit),
+                        display_original=f"{par_level} {display_unit}",
+                    )
                     canonical_value = float(normalized["canonical_value"])
                     canonical_unit = str(normalized["canonical_unit"])
                 except UnitNormalizationError:
@@ -870,9 +964,12 @@ def auto_generate_if_empty() -> Dict[str, Any]:
 
 def behind_service_snapshot() -> Dict[str, Any]:
     items = get_items(include_done=False)
-    behind = [item for item in items if str(item.get("status") or STATUS_TODO) in {STATUS_TODO, STATUS_IN_PROGRESS}]
+    behind = [
+        item
+        for item in items
+        if str(item.get("status") or STATUS_TODO) in {STATUS_TODO, STATUS_IN_PROGRESS}
+    ]
     return {
         "open_items": len(behind),
         "stations": len({str(item.get("station_name") or "Unassigned") for item in behind}),
     }
-
