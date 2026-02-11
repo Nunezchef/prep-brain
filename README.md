@@ -1,230 +1,96 @@
-# 🧠 Prep-Brain
+# Prep-Brain
 
-## A calm, local kitchen brain built for real service.
+Prep-Brain is a Telegram-first, always-on kitchen operations agent.
 
-Prep-Brain is a local, voice-first restaurant assistant that helps you think, remember, and act under real kitchen conditions: not demos, not hype, not "AI for vibes."
+- Runs continuously in the background
+- Keeps Telegram quiet by default
+- Routes explicit ops intents to DB writes (bypasses RAG)
+- Keeps restaurant data separate from reference/general knowledge
 
-You talk to it through Telegram.  
-It listens, remembers context, retrieves from your documents, and answers clearly.
-
-Think of it as a senior operations brain that knows your restaurants, your systems, and your constraints, and stays quiet when it should.
-
----
-
-## What Prep-Brain Is (and Is Not)
-
-### Prep-Brain is:
-
-- Local-first (your data stays on your machine)
-- Voice-first (built for kitchens, not keyboards)
-- Context-aware (sessions + memory)
-- Document-grounded (RAG, not hallucination)
-- Inspectable and reversible
-
-### Prep-Brain is not:
-
-- A SaaS
-- A generic chatbot wrapper
-- A stateless demo
-- An "omniscient" system with hidden memory
-
----
-
-## What's Working Right Now
-
-These features are implemented and functional.
-
-| Capability | Status | Location |
-|---|---|---|
-| Telegram text -> contextual AI reply | ✅ Working | `services/bot.py` + `services/brain.py` |
-| Voice notes -> transcription -> AI reply | ✅ Working | `services/bot.py` + `services/transcriber.py` |
-| Persistent memory (users / sessions / messages) | ✅ Working | `services/memory.py` |
-| RAG ingestion + retrieval with source controls | ✅ Working | `services/rag.py` |
-| Telegram document upload -> knowledge ingestion | ✅ Working | `services/bot.py` |
-| Local dashboard for control and inspection | ✅ Working | `dashboard/app.py` |
-
----
-
-## What the Dashboard Can Do
-
-- Start / stop / restart the bot
-- Check Ollama status
-- View live logs
-- Inspect and clear session history
-- Upload and manage knowledge sources
-- Enable / disable / remove RAG sources
-- Edit config and system prompt live (no restarts)
-
-The dashboard exists for trust and control, not decoration.
-
----
-
-## Knowledge and RAG (How It Actually Works)
-
-Prep-Brain uses a Retrieval-Augmented Generation (RAG) system to index and retrieve from your documents.
-
-You can ingest:
-
-- PDFs (recipes, reference materials, vendor catalogs)
-- SOPs (standard operating procedures)
-- Prep sheets and station notes
-- Menus and tasting notes
-- Post-service notes and retrospectives
-- Vendor sheets and ordering guides
-
-Each source is:
-
-- Indexed with semantic embeddings
-- Stored with metadata (title, type, date)
-- Individually controllable (`active` / `disabled` / removed)
-
-Important:
-
-- The assistant does not "learn" documents like a human.
-- It indexes content, retrieves relevant sections at runtime, and grounds answers in those sections.
-- Sources are always inspectable and reversible.
-- Retrieval only uses sources marked active.
-
-This allows per-restaurant / per-project knowledge separation, so answers stay grounded in the correct venue context.
-
----
-
-## Tech Stack (Chosen on Purpose)
-
-- Python
-- `python-telegram-bot`
-- Ollama (local LLM backend)
-- ChromaDB + `sentence-transformers` (RAG)
-- Streamlit (dashboard)
-- SQLite (memory)
-- `ffmpeg` + `whisper-cli` (audio transcription)
-
-Boring. Replaceable. Reliable.
-
----
-
-## Project Layout
+## Architecture
 
 ```text
-prep-brain/
-├── services/
-│   ├── bot.py           # Telegram handlers (text, voice, documents)
-│   ├── brain.py         # Ollama client + RAG context injection
-│   ├── memory.py        # SQLite session & message memory
-│   ├── rag.py           # Ingestion + retrieval engine
-│   └── transcriber.py   # whisper-cli wrapper
-├── dashboard/
-│   ├── app.py           # Main Streamlit control panel
-│   └── pages/           # Sessions, Test Lab, Settings, Knowledge
-├── scripts/
-│   └── verify_rag.py    # RAG verification tool
-├── config.yaml
-├── .env.example
-└── requirements.txt
+prep_brain/
+  app.py
+  config.py
+  logging.py
+  db/
+  telegram/
+  autonomy/
+  rag/
+  llm/
+  ops/
+  dashboard/
+services/
+  (compatibility + legacy modules during migration)
 ```
 
----
+`prep_brain/*` is the canonical target structure. `services/*` still provides compatibility while migration continues.
 
-## Quick Start
+## Core Rules
 
-### Prerequisites
+- Autonomy is always on when bot process is running.
+- Telegram is an ops console: silent on success, concise on alerts/actions.
+- House/restaurant documents may populate operational DB.
+- General/reference/web knowledge stays RAG-only and never auto-promotes to operational recipe tables.
+- House recipe responses must be complete and source-faithful (no truncation/summarization of ingredient sections).
 
-- Python 3.10+
-- `ffmpeg` in PATH
-- `whisper-cli` in PATH
-- Ollama installed locally
+## Configuration
 
-### 1) Install dependencies
+Single config interface: `prep_brain.config`.
+
+Sources:
+- `config.yaml`
+- `.env` overrides (loaded once)
+
+Important env vars:
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_ALLOWED_USER_IDS`
+- `PREP_BRAIN_DB_PATH` (optional absolute DB override)
+- `OLLAMA_URL`
+
+## Command Surface
+
+Canonical command definitions live in `services/commands_registry.py`.
+
+- `/help` and `/commands` are generated from the registry.
+- Unknown commands return: `Unknown command. /help`
+
+Full grouped list: see `COMMANDS.md`.
+
+## Dev Checklist
+
+1. Create virtualenv and install deps.
+2. Copy `.env.example` to `.env`.
+3. Start bot.
+4. Start dashboard.
+5. Run lint/format/tests.
+
+### Run
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+python -m prep_brain.app
+streamlit run prep_brain/dashboard/app.py
 ```
 
-### 2) Environment setup
+### Quality Gates
 
 ```bash
-cp .env.example .env
+ruff check .
+black .
+pytest
 ```
 
-Set your Telegram bot token in `.env`.
+## Verification Quick Pass
 
-### 3) Configure the app
+1. Start bot and run `/status`.
+2. Run `/autonomy` and confirm tick updates.
+3. Upload a document and confirm ingest is queued + visible via `/ingests`.
+4. Run: `update the price of braised ribs to 4.32 dollars a portion` and verify DB update confirmation.
+5. Query a known house recipe and verify full multi-section output.
 
-Edit `config.yaml`:
+## Security
 
-- Ollama base URL and model
-- Optional Telegram allow-list
-- RAG enable/disable
-
-All of this can also be edited live from the dashboard.
-
-### 4) Start Ollama
-
-```bash
-ollama serve
-```
-
-Pull a model if needed:
-
-```bash
-ollama pull llama3.1:8b
-```
-
-### 5) Run the bot
-
-```bash
-source .venv/bin/activate
-python -m services.bot
-```
-
-### 6) Run the dashboard
-
-```bash
-streamlit run dashboard/app.py
-```
-
----
-
-## Message Flows (Implemented)
-
-### Text
-
-Message -> session memory -> Ollama -> reply
-
-### Voice
-
-Voice note -> `ffmpeg` -> `whisper-cli` -> transcript -> memory -> Ollama -> reply
-
-### Documents
-
-Upload -> ingestion -> indexed knowledge source  
-Source can be enabled/disabled at any time
-
----
-
-## Notes and Safety
-
-- Runtime data (`data/`, `logs/`, `models/`) is intentionally git-ignored
-- Mixed image/text PDFs require OCR before ingestion
-- RAG retrieval only uses sources marked active
-- Knowledge sources can always be removed
-
-Nothing is hidden. Nothing is irreversible.
-
----
-
-## Status
-
-Prep-Brain is an active, evolving system.
-
-It's built for:
-
-- Real kitchens
-- Real constraints
-- Real thinking under pressure
-
-If you're looking for a chatbot demo, this isn't it.
-
-If you're building a thinking tool for operations, welcome.
+- Never commit real secrets.
+- `.env` is ignored; use `.env.example` placeholders.
+- Runtime logs and data are local-only (`logs/`, `data/`).
