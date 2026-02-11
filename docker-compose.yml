@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data # Persist data (DB, documents)
+      - ./logs:/app/logs # Persist logs
+      - ./models:/app/models # Persist models to avoid redownloading
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OLLAMA_URL=http://host.docker.internal:11434
+    env_file:
+      - .env
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "5173:5173"
+    environment:
+      # In Docker networking, services can reach each other by service name.
+      # HOWEVER, the frontend runs in the browser, so it needs to access the backend via localhost from the user's machine.
+      - VITE_API_BASE_URL=http://localhost:8000
+    depends_on:
+      - backend

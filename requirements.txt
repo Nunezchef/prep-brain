@@ -1,6 +1,7 @@
 python-telegram-bot==20.7
 python-dotenv
 requests
+beautifulsoup4
 streamlit
 pyyaml
 chromadb
@@ -12,3 +13,5 @@ psutil
 fastapi
 uvicorn
 python-multipart
+pytest
+python-docx

@@ -1,0 +1,16 @@
+.git
+.env
+.venv
+__pycache__
+*.pyc
+
+# Local data & models (large files)
+data/
+models/
+logs/
+run/
+
+# NodeJS
+node_modules/
+frontend/node_modules/
+frontend/dist/

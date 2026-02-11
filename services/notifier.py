@@ -13,8 +13,9 @@ def send_telegram_notification(message: str):
     # For this MVP, we will try to find a 'default_admin_id' or 'allowed_users' in config.
     # If not found, we can't send.
     
-    # Let's assume the first allowed user is the admin for now if no explicit admin_id
-    allowed_users = config.get("telegram", {}).get("allowed_users", [])
+    # Prefer current config key, but keep legacy fallback.
+    telegram_cfg = config.get("telegram", {})
+    allowed_users = telegram_cfg.get("allowed_user_ids", []) or telegram_cfg.get("allowed_users", [])
     if not token or not allowed_users:
         print("Notifier: No token or allowed users found.")
         return False

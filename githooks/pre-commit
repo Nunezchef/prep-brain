@@ -1,0 +1,19 @@
+#!/bin/sh
+# Pre-commit hook to scan for secrets
+# Redirects output to stderr so it's visible to user
+
+echo "🔒 Scanning for secrets..."
+python3 scripts/scan_secrets.py --staged-only
+
+# Capture exit code of scanner
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -ne 0 ]; then
+    echo "❌ Commit blocked: Secrets detected!"
+    echo "   Please remove secrets from the files listed above."
+    echo "   If false positive, add '# nosec' to the line."
+    exit 1
+fi
+
+echo "✅ No secrets found. Proceeding."
+exit 0

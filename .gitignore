@@ -1,39 +1,42 @@
+# Sensitive Files
+.env
+.env.*
+!.env.example
+secrets.json
+*.pem
+*.key
+unsafe_token.txt
+
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
+*$py.class
 .venv/
 venv/
 env/
-.env.*
-*.egg-info/
-dist/
-build/
 
-# Environment
-.env
+# Data & Logs
+data/
+logs/
+models/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+dashboard_api.log
+dashboard_api_uvicorn.log
 
 # OS
 .DS_Store
+Thumbs.db
 
-# App data
-data/
-data/chroma_db/
-data/documents/
+# IDE
+.idea/
+.vscode/
 
-# Logs and Runtime
-logs/
-run/
-
-# AI Models
-models/
-
-# Frontend build artifacts
-frontend/node_modules/
-frontend/dist/
-
-# Book-specific scripts (do not commit copyrighted references)
-scripts/reingest_flavor_bible.py
-scripts/*_bible*.py
-scripts/*_book*.py
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-lock.yaml

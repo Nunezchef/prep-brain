@@ -4,12 +4,17 @@ memory:
 ollama:
   base_url: http://localhost:11434
   max_tokens: 1000
-  model: llama3.1:8b
+  model: gpt-oss:20b
   temperature: 0.7
 rag:
   enabled: true
   top_k: 3
   similarity_threshold: 0.5
+  chunking:
+    chunk_size_chars: 3500
+    chunk_overlap_chars: 400
+    minimum_chunk_chars: 400
+    dedupe_enabled: true
   ocr:
     enabled: true
     tool: ocrmypdf
@@ -23,6 +28,8 @@ rag:
     enabled: false
     model: ''
     max_images: 8
+  docx:
+    image_only_text_threshold: 5000
 paths:
   log_file: logs/prep-brain.log
   ollama_log_file: logs/ollama.log
@@ -43,9 +50,10 @@ system_prompt: |
 
   Key Instructions:
   1. **Knowledge Retrieval**:
-     - Never simply say "I don't have that in my database." Instead, use your general knowledge to answer.
-     - If you are unsure about a specific fact, ask for clarification.
-     - If asked to browse the web, explicitly state: "I can't browse the web right now," then offer to answer from general knowledge.
+     - When specific restaurant recipes, prep lists, or operational data is requested and no matching context is found in the local knowledge base, say explicitly: "I don't have that specific information in the knowledge base."
+     - For general culinary technique questions (not restaurant-specific), you may use general knowledge but must clearly label it: "From general culinary knowledge (not from your restaurant's records):"
+     - If asked to browse the web, say: "I can't browse the web right now."
+     - Never invent recipe ratios, quantities, or procedures for restaurant-specific dishes.
 
   2. **Voice & Clarity**:
      - If a proper noun (name, place, dish) sounds ambiguous or potentially misheard (e.g., "Eckert" vs "Achatz"), ALWAYS ask: "Did you mean [Name]?" before proceeding.
@@ -61,3 +69,56 @@ telegram:
   allowed_user_ids: []
   bot_token_env_var: TELEGRAM_BOT_TOKEN
   max_document_size_mb: 50
+
+smtp:
+  enabled: false
+  host: "smtp.gmail.com"
+  port: 587
+  sender_email_env_var: "SMTP_EMAIL"
+  password_env_var: "SMTP_PASSWORD"
+
+autonomy:
+  mode: balanced
+  enabled: true
+  cycle_interval_seconds: 2700
+  poll_interval_seconds: 300
+  auto_promote_threshold: 0.75
+  enrich_min_confidence: 0.6
+  enrich_attempt_band_max: 0.74
+  price_swing_alert_pct: 15
+  telegram_alerts: true
+  ingest_completion_message: false
+  web:
+    enabled: false
+    mode: research_only
+    rate_limit_rps: 0.5
+    max_pages_per_task: 3
+    allowed_domains: []
+
+invoice_ingest:
+  enabled: true
+  ocr_engine: tesseract
+  vendor_confidence_threshold: 0.75
+
+ordering:
+  reminder_offsets_minutes:
+    - 60
+    - 15
+  quiet_hours: {}
+
+lexicon:
+  default_aliases:
+    "#": lb
+    cs: case
+    ea: each
+    pcs: each
+    qt: quart
+    pt: pint
+    gal: gallon
+    lex: lexan
+    hp: high priority
+  restaurants: {}
+
+debug:
+  enabled: false
+  ingest_report: false

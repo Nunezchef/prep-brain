@@ -1,0 +1,21 @@
+# Use Node.js for building and serving
+FROM node:20-alpine
+
+# Set working directory
+WORKDIR /app
+
+# Copy package files first
+COPY frontend/package.json frontend/package-lock.json ./
+
+# Install dependencies
+RUN npm ci
+
+# Copy the rest of the frontend code
+COPY frontend/ .
+
+# Expose Vite port
+EXPOSE 5173
+
+# Run in development mode
+# We use --host to ensure it binds to 0.0.0.0
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
