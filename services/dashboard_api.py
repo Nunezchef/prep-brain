@@ -106,6 +106,16 @@ def parse_log_line(raw_line: str) -> Dict[str, str]:
 
 
 def get_bot_status() -> Dict[str, Any]:
+    if os.environ.get("PREP_BRAIN_BOT_CONTROL", "1").strip().lower() in {"0", "false", "no"}:
+        snapshot = autonomy_service.get_autonomy_status_snapshot()
+        running = bool(snapshot.get("is_running"))
+        return {
+            "status": "Running" if running else "Stopped",
+            "running": running,
+            "pid": None,
+            "managed_externally": True,
+        }
+
     pid_file = get_pid_file()
     if not pid_file.exists():
         return {"status": "Stopped", "running": False, "pid": None}
@@ -119,6 +129,13 @@ def get_bot_status() -> Dict[str, Any]:
 
 
 def start_bot() -> Dict[str, Any]:
+    if os.environ.get("PREP_BRAIN_BOT_CONTROL", "1").strip().lower() in {"0", "false", "no"}:
+        return {
+            "changed": False,
+            "message": "Bot is managed by container startup.",
+            "status": get_bot_status(),
+        }
+
     current = get_bot_status()
     if current["running"]:
         return {"changed": False, "message": "Bot already running.", "status": current}
@@ -128,7 +145,7 @@ def start_bot() -> Dict[str, Any]:
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [sys.executable, "-m", "services.bot"]
+    cmd = [sys.executable, "-m", "prep_brain.app"]
 
     try:
         with open(log_file, "a") as log:
@@ -142,7 +159,11 @@ def start_bot() -> Dict[str, Any]:
             pid_file.write_text(str(process.pid))
     except Exception as e:
         print(f"Failed to start bot: {e}")
-        return {"changed": False, "message": f"Failed to start bot: {e}", "status": get_bot_status()}
+        return {
+            "changed": False,
+            "message": f"Failed to start bot: {e}",
+            "status": get_bot_status(),
+        }
 
     time.sleep(0.8)
     return {
@@ -153,6 +174,13 @@ def start_bot() -> Dict[str, Any]:
 
 
 def stop_bot() -> Dict[str, Any]:
+    if os.environ.get("PREP_BRAIN_BOT_CONTROL", "1").strip().lower() in {"0", "false", "no"}:
+        return {
+            "changed": False,
+            "message": "Bot is managed by container startup.",
+            "status": get_bot_status(),
+        }
+
     status = get_bot_status()
     pid = status.get("pid")
     pid_file = get_pid_file()
@@ -185,6 +213,13 @@ def stop_bot() -> Dict[str, Any]:
 
 
 def restart_bot() -> Dict[str, Any]:
+    if os.environ.get("PREP_BRAIN_BOT_CONTROL", "1").strip().lower() in {"0", "false", "no"}:
+        return {
+            "changed": False,
+            "message": "Bot is managed by container startup.",
+            "status": get_bot_status(),
+        }
+
     stop_bot()
     time.sleep(0.4)
     return start_bot()
@@ -193,12 +228,19 @@ def restart_bot() -> Dict[str, Any]:
 def get_ollama_status() -> Dict[str, Any]:
     # In Docker, we check the host URL
     import requests
+
     try:
         # Check if Ollama is responsive
-        base_url = os.environ.get("OLLAMA_URL") or load_config().get("ollama", {}).get("base_url", "http://localhost:11434")
+        base_url = os.environ.get("OLLAMA_URL") or load_config().get("ollama", {}).get(
+            "base_url", "http://localhost:11434"
+        )
         resp = requests.get(base_url, timeout=1)
         if resp.status_code == 200:
-             return {"status": "Running (Host)", "running": True, "pids": []} # PIDs irrelevant for remote
+            return {
+                "status": "Running (Host)",
+                "running": True,
+                "pids": [],
+            }  # PIDs irrelevant for remote
     except Exception:
         pass
     return {"status": "Stopped/Unreachable", "running": False, "pids": []}
@@ -210,12 +252,13 @@ def start_ollama() -> Dict[str, Any]:
     status = get_ollama_status()
     if status["running"]:
         return {"changed": False, "message": "Ollama is running on host.", "status": status}
-    
+
     return {
         "changed": False,
         "message": "Cannot start host Ollama from Docker. Run 'ollama serve' on your Mac.",
         "status": status,
     }
+
 
 def stop_ollama() -> Dict[str, Any]:
     # We cannot stop a host process from Docker easily.
@@ -303,7 +346,7 @@ def get_logs(lines: int = 120, level_filter: str = "all") -> List[Dict[str, str]
             content = f.read()
     except OSError:
         return []
-        
+
     rows = content.splitlines()[-lines:]
 
     filtered: List[str] = []
@@ -345,7 +388,9 @@ def get_telemetry(bot_running: bool, ollama_running: bool) -> Dict[str, Any]:
         except Exception:
             temp_value = None
 
-    signal_value = 98 if (bot_running and ollama_running) else 74 if (bot_running or ollama_running) else 39
+    signal_value = (
+        98 if (bot_running and ollama_running) else 74 if (bot_running or ollama_running) else 39
+    )
 
     config = load_config()
     position = config.get("runtime", {}).get("position_label", "KITCHEN A2")
@@ -546,8 +591,7 @@ def knowledge() -> Dict[str, Any]:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     try:
-        rows = con.execute(
-            """
+        rows = con.execute("""
             SELECT
                 id,
                 ingest_id,
@@ -564,8 +608,7 @@ def knowledge() -> Dict[str, Any]:
                 COALESCE(updated_at, created_at) AS updated_at
             FROM doc_sources
             ORDER BY COALESCE(updated_at, created_at) DESC, id DESC
-            """
-        ).fetchall()
+            """).fetchall()
     finally:
         con.close()
 
@@ -576,13 +619,23 @@ def knowledge() -> Dict[str, Any]:
         rag_row = rag_by_ingest.get(ingest_id, {})
         source_id = str(rag_row.get("id") or "").strip()
         ingest_status = str(raw.get("status") or "unknown")
+        extracted_text_chars = int(raw.get("extracted_text_chars") or 0)
+        table_chars = int(rag_row.get("extracted_from_tables_chars") or 0)
+        paragraph_chars = int(rag_row.get("extracted_from_paragraphs_chars") or 0)
+        if extracted_text_chars >= 20000:
+            text_profile_label = "TEXT-RICH"
+        elif table_chars > paragraph_chars and table_chars > 0:
+            text_profile_label = "TABLES ONLY"
+        else:
+            text_profile_label = "LOW TEXT"
         items.append(
             {
                 "id": source_id or ingest_id,
                 "source_id": source_id or None,
                 "ingest_id": ingest_id,
                 "source_name": raw.get("filename"),
-                "title": rag_row.get("title") or Path(str(raw.get("filename") or "")).stem.replace("_", " ").title(),
+                "title": rag_row.get("title")
+                or Path(str(raw.get("filename") or "")).stem.replace("_", " ").title(),
                 "type": rag_row.get("type") or raw.get("source_type"),
                 "doc_source_type": raw.get("source_type"),
                 "knowledge_tier": rag_row.get("knowledge_tier"),
@@ -590,16 +643,17 @@ def knowledge() -> Dict[str, Any]:
                 "updated_at": raw.get("updated_at"),
                 "chunk_count": int(raw.get("chunk_count") or 0),
                 "chunks_added": int(raw.get("chunks_added") or 0),
-                "extracted_text_chars": int(raw.get("extracted_text_chars") or 0),
-                "status": rag_row.get("status") or ("active" if ingest_status in {"ok", "warn"} and source_id else ingest_status),
+                "extracted_text_chars": extracted_text_chars,
+                "status": rag_row.get("status")
+                or ("active" if ingest_status in {"ok", "warn"} and source_id else ingest_status),
                 "ingest_status": ingest_status,
                 "warnings": rag_row.get("warnings") or [],
                 "ocr_required": bool(rag_row.get("ocr_required", False)),
                 "ocr_applied": bool(rag_row.get("ocr_applied", False)),
                 "image_rich": bool(rag_row.get("image_rich", False)),
-                "text_profile_label": rag_row.get("text_profile_label"),
-                "extracted_from_tables_chars": int(rag_row.get("extracted_from_tables_chars") or 0),
-                "extracted_from_paragraphs_chars": int(rag_row.get("extracted_from_paragraphs_chars") or 0),
+                "text_profile_label": text_profile_label,
+                "extracted_from_tables_chars": table_chars,
+                "extracted_from_paragraphs_chars": paragraph_chars,
                 "can_toggle": bool(source_id),
                 "can_delete": True,
             }
@@ -679,7 +733,9 @@ async def knowledge_upload(
     suffix = Path(name).suffix.lower()
 
     if suffix not in {".pdf", ".txt", ".docx"}:
-        raise HTTPException(status_code=400, detail="Only .pdf, .txt, and .docx files are supported")
+        raise HTTPException(
+            status_code=400, detail="Only .pdf, .txt, and .docx files are supported"
+        )
 
     target = BASE_DIR / "data" / "documents" / name
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -776,7 +832,11 @@ def config_put(config_data: Dict[str, Any]) -> Dict[str, Any]:
             cleaned = {}
             for k, v in d.items():
                 key_lower = k.lower()
-                if any(p in key_lower for p in SENSITIVE_PATTERNS) and isinstance(v, str) and v.strip():
+                if (
+                    any(p in key_lower for p in SENSITIVE_PATTERNS)
+                    and isinstance(v, str)
+                    and v.strip()
+                ):
                     continue  # silently strip secret values
                 cleaned[k] = _strip_secrets(v, f"{path}.{k}")
             return cleaned
@@ -814,6 +874,7 @@ def lexicon_put(payload: Dict[str, Any]) -> Dict[str, Any]:
 # Feature 1: Provider Directory (Vendors)
 # ==============================================================================
 
+
 class Vendor(BaseModel):
     name: str
     contact_name: Optional[str] = None
@@ -828,7 +889,7 @@ class Vendor(BaseModel):
 def init_db():
     db_path = get_memory_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     con = sqlite3.connect(db_path)
     try:
         # Create vendors table
@@ -850,6 +911,7 @@ def init_db():
         con.commit()
     finally:
         con.close()
+
 
 # Initialize DB on import (or startup)
 try:
@@ -878,13 +940,22 @@ def vendors_create(vendor: Vendor) -> Dict[str, Any]:
     db_path = get_memory_db_path()
     con = sqlite3.connect(db_path)
     try:
-        cur = con.execute("""
+        cur = con.execute(
+            """
             INSERT INTO vendors (name, contact_name, email, phone, ordering_window, cutoff_time, preferred_method, notes)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            vendor.name, vendor.contact_name, vendor.email, vendor.phone, 
-            vendor.ordering_window, vendor.cutoff_time, vendor.preferred_method, vendor.notes
-        ))
+        """,
+            (
+                vendor.name,
+                vendor.contact_name,
+                vendor.email,
+                vendor.phone,
+                vendor.ordering_window,
+                vendor.cutoff_time,
+                vendor.preferred_method,
+                vendor.notes,
+            ),
+        )
         con.commit()
         return {"ok": True, "id": cur.lastrowid}
     except Exception as e:
@@ -898,14 +969,24 @@ def vendors_update(vendor_id: int, vendor: Vendor) -> Dict[str, Any]:
     db_path = get_memory_db_path()
     con = sqlite3.connect(db_path)
     try:
-        cur = con.execute("""
+        cur = con.execute(
+            """
             UPDATE vendors 
             SET name=?, contact_name=?, email=?, phone=?, ordering_window=?, cutoff_time=?, preferred_method=?, notes=?, updated_at=CURRENT_TIMESTAMP
             WHERE id=?
-        """, (
-            vendor.name, vendor.contact_name, vendor.email, vendor.phone, 
-            vendor.ordering_window, vendor.cutoff_time, vendor.preferred_method, vendor.notes, vendor_id
-        ))
+        """,
+            (
+                vendor.name,
+                vendor.contact_name,
+                vendor.email,
+                vendor.phone,
+                vendor.ordering_window,
+                vendor.cutoff_time,
+                vendor.preferred_method,
+                vendor.notes,
+                vendor_id,
+            ),
+        )
         con.commit()
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="Vendor not found")
@@ -932,6 +1013,7 @@ def vendors_delete(vendor_id: int) -> Dict[str, Any]:
 # Feature 3: Order Guide Builder
 # ==============================================================================
 
+
 class VendorItem(BaseModel):
     vendor_id: Optional[int] = None
     name: str
@@ -940,6 +1022,7 @@ class VendorItem(BaseModel):
     price: Optional[float] = None
     category: Optional[str] = None
     is_active: bool = True
+
 
 def init_db_v3():
     # Helper to extend schema for Feature 3
@@ -965,11 +1048,13 @@ def init_db_v3():
     finally:
         con.close()
 
+
 # Run init for v3
 try:
     init_db_v3()
 except Exception as e:
     print(f"DB Init V3 failed: {e}")
+
 
 @app.get("/api/vendors/{vendor_id}/items")
 def vendor_items_list(vendor_id: int) -> Dict[str, Any]:
@@ -977,22 +1062,34 @@ def vendor_items_list(vendor_id: int) -> Dict[str, Any]:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     try:
-        rows = con.execute("SELECT * FROM vendor_items WHERE vendor_id=? ORDER BY name ASC", (vendor_id,)).fetchall()
+        rows = con.execute(
+            "SELECT * FROM vendor_items WHERE vendor_id=? ORDER BY name ASC", (vendor_id,)
+        ).fetchall()
         return {"items": [dict(row) for row in rows]}
     finally:
         con.close()
+
 
 @app.post("/api/vendors/{vendor_id}/items")
 def vendor_items_create(vendor_id: int, item: VendorItem) -> Dict[str, Any]:
     db_path = get_memory_db_path()
     con = sqlite3.connect(db_path)
     try:
-        cur = con.execute("""
+        cur = con.execute(
+            """
             INSERT INTO vendor_items (vendor_id, name, item_code, unit, price, category, is_active)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            vendor_id, item.name, item.item_code, item.unit, item.price, item.category, item.is_active
-        ))
+        """,
+            (
+                vendor_id,
+                item.name,
+                item.item_code,
+                item.unit,
+                item.price,
+                item.category,
+                item.is_active,
+            ),
+        )
         con.commit()
         return {"ok": True, "id": cur.lastrowid}
     except Exception as e:
@@ -1000,24 +1097,35 @@ def vendor_items_create(vendor_id: int, item: VendorItem) -> Dict[str, Any]:
     finally:
         con.close()
 
+
 @app.put("/api/vendors/items/{item_id}")
 def vendor_items_update(item_id: int, item: VendorItem) -> Dict[str, Any]:
     db_path = get_memory_db_path()
     con = sqlite3.connect(db_path)
     try:
-        cur = con.execute("""
+        cur = con.execute(
+            """
             UPDATE vendor_items 
             SET name=?, item_code=?, unit=?, price=?, category=?, is_active=?, updated_at=CURRENT_TIMESTAMP
             WHERE id=?
-        """, (
-            item.name, item.item_code, item.unit, item.price, item.category, item.is_active, item_id
-        ))
+        """,
+            (
+                item.name,
+                item.item_code,
+                item.unit,
+                item.price,
+                item.category,
+                item.is_active,
+                item_id,
+            ),
+        )
         con.commit()
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="Item not found")
         return {"ok": True}
     finally:
         con.close()
+
 
 @app.delete("/api/vendors/items/{item_id}")
 def vendor_items_delete(item_id: int) -> Dict[str, Any]:
@@ -1036,6 +1144,7 @@ def vendor_items_delete(item_id: int) -> Dict[str, Any]:
 # ==============================================================================
 # Feature 4: Inventory Count Sheets
 # ==============================================================================
+
 
 @app.get("/api/inventory/sheets")
 def inventory_sheets() -> Dict[str, Any]:
@@ -1059,6 +1168,7 @@ def inventory_sheets() -> Dict[str, Any]:
 # Feature 9: Prep Cockpit (Recipes / Par Levels)
 # ==============================================================================
 
+
 class PrepItem(BaseModel):
     name: str
     category: Optional[str] = None
@@ -1070,15 +1180,18 @@ class PrepItem(BaseModel):
     allergens: List[str] = []
     is_active: bool = True
 
+
 class Allergen(BaseModel):
     id: int
     name: str
 
+
 class Station(BaseModel):
     name: str
     description: Optional[str] = None
-    instructions: Optional[str] = None # Markdown
+    instructions: Optional[str] = None  # Markdown
     is_active: bool = True
+
 
 class PrepAuditPayload(BaseModel):
     updates: Dict[int, float]  # {id: new_on_hand}
@@ -1106,23 +1219,23 @@ def init_db_v9():
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         """)
-        
+
         # Migrations for existing tables
         try:
             con.execute("ALTER TABLE recipes ADD COLUMN category TEXT")
         except Exception:
             pass
-            
+
         try:
             con.execute("ALTER TABLE recipes ADD COLUMN unit TEXT DEFAULT 'unit'")
         except Exception:
             pass
-            
+
         try:
             con.execute("ALTER TABLE recipes ADD COLUMN par_level REAL DEFAULT 0.0")
         except Exception:
             pass
-            
+
         try:
             con.execute("ALTER TABLE recipes ADD COLUMN on_hand REAL DEFAULT 0.0")
         except Exception:
@@ -1132,7 +1245,7 @@ def init_db_v9():
             con.execute("ALTER TABLE recipes ADD COLUMN prep_time_minutes INTEGER DEFAULT 0")
         except Exception:
             pass
-            
+
         try:
             con.execute("ALTER TABLE recipes ADD COLUMN station_id INTEGER")
         except Exception:
@@ -1166,16 +1279,29 @@ def init_db_v9():
             FOREIGN KEY(allergen_id) REFERENCES allergens(id)
         )
         """)
-        
+
         # Seed Allergens
         count = con.execute("SELECT count(*) FROM allergens").fetchone()[0]
         if count == 0:
-            defaults = ["Milk", "Eggs", "Fish", "Shellfish", "Tree Nuts", "Peanuts", "Wheat", "Soy", "Sesame"]
-            con.executemany("INSERT INTO allergens (name) VALUES (?)", [(name,) for name in defaults])
+            defaults = [
+                "Milk",
+                "Eggs",
+                "Fish",
+                "Shellfish",
+                "Tree Nuts",
+                "Peanuts",
+                "Wheat",
+                "Soy",
+                "Sesame",
+            ]
+            con.executemany(
+                "INSERT INTO allergens (name) VALUES (?)", [(name,) for name in defaults]
+            )
 
         con.commit()
     finally:
         con.close()
+
 
 # Run init for v9
 try:
@@ -1195,12 +1321,15 @@ def prep_list() -> Dict[str, Any]:
         for r in rows:
             d = dict(r)
             # Get allergens for this recipe
-            alg_rows = con.execute("""
+            alg_rows = con.execute(
+                """
                 SELECT a.name 
                 FROM recipe_allergens ra 
                 JOIN allergens a ON ra.allergen_id = a.id 
                 WHERE ra.recipe_id = ?
-            """, (d["id"],)).fetchall()
+            """,
+                (d["id"],),
+            ).fetchall()
             d["allergens"] = [row[0] for row in alg_rows]
             items.append(d)
         return {"items": items}
@@ -1213,14 +1342,24 @@ def prep_create(item: PrepItem) -> Dict[str, Any]:
     db_path = get_memory_db_path()
     con = sqlite3.connect(db_path)
     try:
-        cur = con.execute("""
+        cur = con.execute(
+            """
             INSERT INTO recipes (name, category, unit, par_level, on_hand, prep_time_minutes, station_id, is_active)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            item.name, item.category, item.unit, item.par_level, item.on_hand, item.prep_time_minutes, item.station_id, item.is_active
-        ))
+        """,
+            (
+                item.name,
+                item.category,
+                item.unit,
+                item.par_level,
+                item.on_hand,
+                item.prep_time_minutes,
+                item.station_id,
+                item.is_active,
+            ),
+        )
         new_id = cur.lastrowid
-        
+
         # Handle allergens
         if item.allergens:
             # Resolve names to IDs (or create if not exist? For now assume strict list or create on fly if generic)
@@ -1229,7 +1368,10 @@ def prep_create(item: PrepItem) -> Dict[str, Any]:
                 # Find or ignore? Let's simplistic: find ID for name
                 row = con.execute("SELECT id FROM allergens WHERE name = ?", (alg_name,)).fetchone()
                 if row:
-                    con.execute("INSERT OR IGNORE INTO recipe_allergens (recipe_id, allergen_id) VALUES (?, ?)", (new_id, row[0]))
+                    con.execute(
+                        "INSERT OR IGNORE INTO recipe_allergens (recipe_id, allergen_id) VALUES (?, ?)",
+                        (new_id, row[0]),
+                    )
 
         con.commit()
         return {"ok": True, "id": new_id}
@@ -1244,21 +1386,35 @@ def prep_update(item_id: int, item: PrepItem) -> Dict[str, Any]:
     db_path = get_memory_db_path()
     con = sqlite3.connect(db_path)
     try:
-        cur = con.execute("""
+        cur = con.execute(
+            """
             UPDATE recipes 
             SET name=?, category=?, unit=?, par_level=?, on_hand=?, prep_time_minutes=?, station_id=?, is_active=?, updated_at=CURRENT_TIMESTAMP
             WHERE id=?
-        """, (
-            item.name, item.category, item.unit, item.par_level, item.on_hand, item.prep_time_minutes, item.station_id, item.is_active, item_id
-        ))
-        
+        """,
+            (
+                item.name,
+                item.category,
+                item.unit,
+                item.par_level,
+                item.on_hand,
+                item.prep_time_minutes,
+                item.station_id,
+                item.is_active,
+                item_id,
+            ),
+        )
+
         # Update allergens: delete all, re-insert
         con.execute("DELETE FROM recipe_allergens WHERE recipe_id=?", (item_id,))
         if item.allergens:
             for alg_name in item.allergens:
                 row = con.execute("SELECT id FROM allergens WHERE name = ?", (alg_name,)).fetchone()
                 if row:
-                    con.execute("INSERT OR IGNORE INTO recipe_allergens (recipe_id, allergen_id) VALUES (?, ?)", (item_id, row[0]))
+                    con.execute(
+                        "INSERT OR IGNORE INTO recipe_allergens (recipe_id, allergen_id) VALUES (?, ?)",
+                        (item_id, row[0]),
+                    )
 
         con.commit()
         if cur.rowcount == 0:
@@ -1288,11 +1444,14 @@ def prep_audit(payload: PrepAuditPayload) -> Dict[str, Any]:
     con = sqlite3.connect(db_path)
     try:
         for item_id, new_on_hand in payload.updates.items():
-            con.execute("""
+            con.execute(
+                """
                 UPDATE recipes 
                 SET on_hand = ?, updated_at = CURRENT_TIMESTAMP 
                 WHERE id = ?
-            """, (new_on_hand, item_id))
+            """,
+                (new_on_hand, item_id),
+            )
         con.commit()
         return {"ok": True, "updated_count": len(payload.updates)}
     except Exception as e:
@@ -1312,6 +1471,7 @@ def station_list() -> Dict[str, Any]:
     finally:
         con.close()
 
+
 @app.get("/api/allergens")
 def allergen_list() -> Dict[str, Any]:
     db_path = get_memory_db_path()
@@ -1323,17 +1483,20 @@ def allergen_list() -> Dict[str, Any]:
     finally:
         con.close()
 
+
 # ==============================================================================
 # Feature 13: Receiving Log
 # ==============================================================================
 
+
 class ReceivingLog(BaseModel):
-    date: str # ISO YYYY-MM-DD
+    date: str  # ISO YYYY-MM-DD
     supplier: str
     invoice_number: Optional[str] = None
     total_amount: float = 0.0
     has_issue: bool = False
     notes: Optional[str] = None
+
 
 def init_db_v13():
     db_path = get_memory_db_path()
@@ -1360,11 +1523,13 @@ def init_db_v13():
     finally:
         con.close()
 
+
 # Run init v13
 try:
     init_db_v13()
 except Exception as e:
     print(f"DB Init V13 failed: {e}")
+
 
 @app.post("/api/receiving")
 def receiving_create(item: ReceivingLog) -> Dict[str, Any]:
@@ -1377,21 +1542,24 @@ def receiving_create(item: ReceivingLog) -> Dict[str, Any]:
             (item.supplier.strip(),),
         ).fetchone()
         vendor_id = int(vendor_row["id"]) if vendor_row else None
-        cur = con.execute("""
+        cur = con.execute(
+            """
             INSERT INTO receiving_log (
                 vendor_id, invoice_number, item_name, quantity_received, unit, unit_cost, total_cost,
                 temperature_check, quality_ok, notes, received_by, received_at
             )
             VALUES (?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, ?, 'dashboard', ?)
-        """, (
-            vendor_id,
-            item.invoice_number,
-            item.supplier,
-            item.total_amount,
-            0 if item.has_issue else 1,
-            item.notes,
-            f"{item.date} 12:00:00",
-        ))
+        """,
+            (
+                vendor_id,
+                item.invoice_number,
+                item.supplier,
+                item.total_amount,
+                0 if item.has_issue else 1,
+                item.notes,
+                f"{item.date} 12:00:00",
+            ),
+        )
         con.commit()
         return {"ok": True, "id": cur.lastrowid}
     except Exception as e:
@@ -1399,14 +1567,14 @@ def receiving_create(item: ReceivingLog) -> Dict[str, Any]:
     finally:
         con.close()
 
+
 @app.get("/api/receiving")
 def receiving_list() -> Dict[str, Any]:
     db_path = get_memory_db_path()
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     try:
-        rows = con.execute(
-            """
+        rows = con.execute("""
             SELECT
                 rl.id,
                 DATE(rl.received_at) AS date,
@@ -1420,8 +1588,7 @@ def receiving_list() -> Dict[str, Any]:
             LEFT JOIN vendors v ON v.id = rl.vendor_id
             ORDER BY rl.received_at DESC, rl.id DESC
             LIMIT 50
-            """
-        ).fetchall()
+            """).fetchall()
         return {"items": [dict(row) for row in rows]}
     finally:
         con.close()
@@ -1432,12 +1599,13 @@ def station_create(item: Station) -> Dict[str, Any]:
     db_path = get_memory_db_path()
     con = sqlite3.connect(db_path)
     try:
-        cur = con.execute("""
+        cur = con.execute(
+            """
             INSERT INTO stations (name, description, instructions, is_active)
             VALUES (?, ?, ?, ?)
-        """, (
-            item.name, item.description, item.instructions, item.is_active
-        ))
+        """,
+            (item.name, item.description, item.instructions, item.is_active),
+        )
         con.commit()
         return {"ok": True, "id": cur.lastrowid}
     except Exception as e:
@@ -1445,24 +1613,27 @@ def station_create(item: Station) -> Dict[str, Any]:
     finally:
         con.close()
 
+
 @app.put("/api/stations/{item_id}")
 def station_update(item_id: int, item: Station) -> Dict[str, Any]:
     db_path = get_memory_db_path()
     con = sqlite3.connect(db_path)
     try:
-        cur = con.execute("""
+        cur = con.execute(
+            """
             UPDATE stations 
             SET name=?, description=?, instructions=?, is_active=?, updated_at=CURRENT_TIMESTAMP
             WHERE id=?
-        """, (
-            item.name, item.description, item.instructions, item.is_active, item_id
-        ))
+        """,
+            (item.name, item.description, item.instructions, item.is_active, item_id),
+        )
         con.commit()
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="Item not found")
         return {"ok": True}
     finally:
         con.close()
+
 
 @app.delete("/api/stations/{item_id}")
 def station_delete(item_id: int) -> Dict[str, Any]:
@@ -1476,7 +1647,6 @@ def station_delete(item_id: int) -> Dict[str, Any]:
         return {"ok": True}
     finally:
         con.close()
-        
 
 
 @app.post("/api/inventory/counts")
@@ -1487,7 +1657,7 @@ def inventory_counts_save(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         date = payload.get("date", datetime.now().strftime("%Y-%m-%d"))
         counts = payload.get("counts", [])
-        
+
         # Ensure table exists (idempotent for now, ideally in init_db)
         con.execute("""
             CREATE TABLE IF NOT EXISTS inventory_counts (
@@ -1499,13 +1669,16 @@ def inventory_counts_save(payload: Dict[str, Any]) -> Dict[str, Any]:
                 FOREIGN KEY(item_id) REFERENCES vendor_items(id)
             )
         """)
-        
+
         for item in counts:
-            con.execute("""
+            con.execute(
+                """
                 INSERT INTO inventory_counts (date, item_id, quantity)
                 VALUES (?, ?, ?)
-            """, (date, item["item_id"], item["quantity"]))
-            
+            """,
+                (date, item["item_id"], item["quantity"]),
+            )
+
         con.commit()
         return {"ok": True, "count": len(counts)}
     except Exception as e:
@@ -1518,17 +1691,19 @@ def inventory_counts_save(payload: Dict[str, Any]) -> Dict[str, Any]:
 # Feature 6: Recipe Database
 # ==============================================================================
 
+
 class Recipe(BaseModel):
     name: str
     yield_amount: Optional[float] = 1.0
     yield_unit: Optional[str] = "portion"
-    ingredients: Optional[str] = "[]" # JSON string of list of dicts
+    ingredients: Optional[str] = "[]"  # JSON string of list of dicts
     instructions: Optional[str] = ""
     is_active: bool = True
     sales_price: Optional[float] = 0.0
     recent_sales_count: Optional[int] = 0
     par_level: Optional[float] = 0.0
     on_hand: Optional[float] = 0.0
+
 
 @app.get("/api/recipes")
 def recipes_list() -> Dict[str, Any]:
@@ -1554,14 +1729,16 @@ def recipes_list() -> Dict[str, Any]:
                 on_hand REAL DEFAULT 0
             )
         """)
-        
+
         # Simple migration for existing tables
         try:
             con.execute("ALTER TABLE recipes ADD COLUMN sales_price REAL DEFAULT 0")
-        except: pass
+        except:
+            pass
         try:
             con.execute("ALTER TABLE recipes ADD COLUMN recent_sales_count INTEGER DEFAULT 0")
-        except: pass
+        except:
+            pass
         try:
             con.execute("ALTER TABLE recipes ADD COLUMN par_level REAL DEFAULT 0")
         except:
@@ -1570,45 +1747,56 @@ def recipes_list() -> Dict[str, Any]:
             con.execute("ALTER TABLE recipes ADD COLUMN on_hand REAL DEFAULT 0")
         except:
             pass
-        
+
         rows = con.execute("SELECT * FROM recipes WHERE is_active=1 ORDER BY name ASC").fetchall()
         recipes = [dict(row) for row in rows]
-        
+
         # Calculate costs
         # 1. Get all vendor items with price
-        item_rows = con.execute("SELECT id, price FROM vendor_items WHERE price IS NOT NULL").fetchall()
-        price_map = {row["id"]: row["price"] for row in item_rows} # { item_id: price }
+        item_rows = con.execute(
+            "SELECT id, price FROM vendor_items WHERE price IS NOT NULL"
+        ).fetchall()
+        price_map = {row["id"]: row["price"] for row in item_rows}  # { item_id: price }
 
         # 2. Compute cost for each recipe
         for recipe in recipes:
-             cost = 0.0
-             try:
-                 ingredients = json.loads(recipe["ingredients"]) if recipe["ingredients"] else []  # safe JSON parse
-                 # Better to use json.loads if we stored as JSON string. The current implementation stores as JSON string "[]".
-                 import json
-                 ingredients = json.loads(recipe["ingredients"]) if recipe["ingredients"] else []
-                 
-                 for ing in ingredients:
-                     # ing: { "item": "Onion", "qty": "1", "unit": "pc", "item_id": ? } 
-                     # Wait, the current frontend saves free-text "item". 
-                     # To support costing, we need to link ingredients to vendor_items.
-                     # The current plan said "Assuming units match for MVP".
-                     # BUT the frontend "ingredients" is currently just: [{ item: 'Onion', qty: '1', unit: 'pc' }]
-                     # It DOES NOT store vendor_item_id. 
-                     # I need to update the recipe save to try and match items, OR update the frontend to select items.
-                     # For now, I will try to match by NAME if item_id is missing, or just skip if no match.
-                     # Let's try to match by name for MVP as per plan "mapped to vendor item if possible".
-                     pass
-             except:
-                 pass
-             recipe["estimated_cost"] = 0.0
+            cost = 0.0
+            try:
+                ingredients = (
+                    json.loads(recipe["ingredients"]) if recipe["ingredients"] else []
+                )  # safe JSON parse
+                # Better to use json.loads if we stored as JSON string. The current implementation stores as JSON string "[]".
+                import json
+
+                ingredients = json.loads(recipe["ingredients"]) if recipe["ingredients"] else []
+
+                for ing in ingredients:
+                    # ing: { "item": "Onion", "qty": "1", "unit": "pc", "item_id": ? }
+                    # Wait, the current frontend saves free-text "item".
+                    # To support costing, we need to link ingredients to vendor_items.
+                    # The current plan said "Assuming units match for MVP".
+                    # BUT the frontend "ingredients" is currently just: [{ item: 'Onion', qty: '1', unit: 'pc' }]
+                    # It DOES NOT store vendor_item_id.
+                    # I need to update the recipe save to try and match items, OR update the frontend to select items.
+                    # For now, I will try to match by NAME if item_id is missing, or just skip if no match.
+                    # Let's try to match by name for MVP as per plan "mapped to vendor item if possible".
+                    pass
+            except:
+                pass
+            recipe["estimated_cost"] = 0.0
 
         # actually, I need to implement the linking in the frontend or smart-matching here.
         # Let's fetch all items map by Name as well for fallback.
-        item_name_map = {row["name"].lower(): row["price"] for row in con.execute("SELECT name, price FROM vendor_items WHERE price IS NOT NULL").fetchall()}
-        
+        item_name_map = {
+            row["name"].lower(): row["price"]
+            for row in con.execute(
+                "SELECT name, price FROM vendor_items WHERE price IS NOT NULL"
+            ).fetchall()
+        }
+
         result = []
         import json
+
         for recipe in recipes:
             total_cost = 0.0
             try:
@@ -1617,37 +1805,47 @@ def recipes_list() -> Dict[str, Any]:
                     # Try to find price
                     price = 0.0
                     qty = float(ing.get("qty", 0) or 0)
-                    
+
                     # If we had item_id, use it. But we only have name currently from the UI.
                     name = ing.get("item", "").strip().lower()
                     if name in item_name_map:
                         price = item_name_map[name]
-                    
+
                     total_cost += price * qty
             except Exception:
-                pass # JSON error or other
-            
+                pass  # JSON error or other
+
             recipe["estimated_cost"] = round(total_cost, 2)
             result.append(recipe)
-            
+
         return {"recipes": result}
     finally:
         con.close()
+
 
 @app.post("/api/recipes")
 def recipes_create(recipe: Recipe) -> Dict[str, Any]:
     db_path = get_memory_db_path()
     con = sqlite3.connect(db_path)
     try:
-        cur = con.execute("""
+        cur = con.execute(
+            """
             INSERT INTO recipes (name, yield_amount, yield_unit, ingredients, instructions, is_active, sales_price, recent_sales_count, par_level, on_hand)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            recipe.name, recipe.yield_amount, recipe.yield_unit, 
-            recipe.ingredients, recipe.instructions, recipe.is_active,
-            recipe.sales_price, recipe.recent_sales_count,
-            recipe.par_level, recipe.on_hand
-        ))
+        """,
+            (
+                recipe.name,
+                recipe.yield_amount,
+                recipe.yield_unit,
+                recipe.ingredients,
+                recipe.instructions,
+                recipe.is_active,
+                recipe.sales_price,
+                recipe.recent_sales_count,
+                recipe.par_level,
+                recipe.on_hand,
+            ),
+        )
         con.commit()
         return {"ok": True, "id": cur.lastrowid}
     except Exception as e:
@@ -1655,22 +1853,32 @@ def recipes_create(recipe: Recipe) -> Dict[str, Any]:
     finally:
         con.close()
 
+
 @app.put("/api/recipes/{recipe_id}")
 def recipes_update(recipe_id: int, recipe: Recipe) -> Dict[str, Any]:
     db_path = get_memory_db_path()
     con = sqlite3.connect(db_path)
     try:
-        cur = con.execute("""
+        cur = con.execute(
+            """
             UPDATE recipes 
             SET name=?, yield_amount=?, yield_unit=?, ingredients=?, instructions=?, is_active=?, sales_price=?, recent_sales_count=?, par_level=?, on_hand=?, updated_at=CURRENT_TIMESTAMP
             WHERE id=?
-        """, (
-            recipe.name, recipe.yield_amount, recipe.yield_unit, 
-            recipe.ingredients, recipe.instructions, recipe.is_active,
-            recipe.sales_price, recipe.recent_sales_count,
-            recipe.par_level, recipe.on_hand,
-            recipe_id
-        ))
+        """,
+            (
+                recipe.name,
+                recipe.yield_amount,
+                recipe.yield_unit,
+                recipe.ingredients,
+                recipe.instructions,
+                recipe.is_active,
+                recipe.sales_price,
+                recipe.recent_sales_count,
+                recipe.par_level,
+                recipe.on_hand,
+                recipe_id,
+            ),
+        )
         con.commit()
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="Recipe not found")
@@ -1678,39 +1886,42 @@ def recipes_update(recipe_id: int, recipe: Recipe) -> Dict[str, Any]:
     finally:
         con.close()
 
+
 @app.get("/api/menu-engineering")
 def menu_engineering() -> Dict[str, Any]:
     # Reuse recipes_list logic to get costs, then add analysis
     recipes_payload = recipes_list()
     recipes = recipes_payload.get("recipes", [])
-    
+
     if not recipes:
         return {"items": []}
 
     # Calculate avg profit and avg popularit (popularity is just count for now)
     total_contribution = 0.0
     total_sold = 0
-    
+
     analyzed = []
-    
+
     for r in recipes:
         price = float(r.get("sales_price", 0) or 0)
         cost = float(r.get("estimated_cost", 0) or 0)
         count = int(r.get("recent_sales_count", 0) or 0)
-        
+
         contribution = price - cost
-        total_contribution += (contribution * count)
+        total_contribution += contribution * count
         total_sold += count
-        
-        analyzed.append({
-            "id": r["id"],
-            "name": r["name"],
-            "cost": cost,
-            "price": price,
-            "margin": contribution,
-            "count": count,
-            "margin_pc": (contribution / price) if price > 0 else 0
-        })
+
+        analyzed.append(
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "cost": cost,
+                "price": price,
+                "margin": contribution,
+                "count": count,
+                "margin_pc": (contribution / price) if price > 0 else 0,
+            }
+        )
 
     avg_contribution = (total_contribution / total_sold) if total_sold > 0 else 0
     # Popularity benchmark: (100% / number of items) * 0.7 (70% rule) involves more complex math.
@@ -1724,7 +1935,7 @@ def menu_engineering() -> Dict[str, Any]:
         high_profit = item["margin"] >= avg_contribution
         # High/Low Popularity
         high_pop = item["count"] >= avg_count
-        
+
         classification = "Dog"
         if high_profit and high_pop:
             classification = "Star"
@@ -1732,17 +1943,12 @@ def menu_engineering() -> Dict[str, Any]:
             classification = "Puzzle"
         elif not high_profit and high_pop:
             classification = "Plowhorse"
-            
+
         item["classification"] = classification
         final_items.append(item)
-        
-    return {
-        "items": final_items,
-        "averages": {
-            "margin": avg_contribution,
-            "count": avg_count
-        }
-    }
+
+    return {"items": final_items, "averages": {"margin": avg_contribution, "count": avg_count}}
+
 
 @app.post("/api/prep-update")
 def prep_update(updates: Dict[str, float]) -> Dict[str, Any]:
@@ -1751,15 +1957,19 @@ def prep_update(updates: Dict[str, float]) -> Dict[str, Any]:
     con = sqlite3.connect(db_path)
     try:
         for rid_str, qty in updates.items():
-            if not rid_str.isdigit(): continue
+            if not rid_str.isdigit():
+                continue
             rid = int(rid_str)
-            con.execute("UPDATE recipes SET on_hand=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (qty, rid))
+            con.execute(
+                "UPDATE recipes SET on_hand=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (qty, rid)
+            )
         con.commit()
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         con.close()
+
 
 @app.delete("/api/recipes/{recipe_id}")
 def recipes_delete(recipe_id: int) -> Dict[str, Any]:
@@ -1775,13 +1985,16 @@ def recipes_delete(recipe_id: int) -> Dict[str, Any]:
     finally:
         con.close()
 
+
 # ==============================================================================
 # Feature 2: Email Composer
 # ==============================================================================
 
+
 class DraftEmailPayload(BaseModel):
     vendor_id: int
     context: str
+
 
 @app.post("/api/composer/draft")
 def composer_draft(payload: DraftEmailPayload) -> Dict[str, Any]:
@@ -1800,7 +2013,7 @@ def composer_draft(payload: DraftEmailPayload) -> Dict[str, Any]:
     # 2. Construct Prompt
     vendor_name = vendor["name"]
     contact_name = vendor["contact_name"] or "Sales Rep"
-    
+
     prompt = (
         f"Write a professional, concise procurement email to {vendor_name} (Contact: {contact_name}).\n"
         f"Context/Requirements: {payload.context}\n\n"
@@ -1816,20 +2029,17 @@ def composer_draft(payload: DraftEmailPayload) -> Dict[str, Any]:
     # 3. Call Brain
     # Note: chat() enforces chef persona, so we try to override via strong instructions
     response = chat([("user", prompt)])
-    
+
     # 4. Parse (Simple heuristic)
     subject = "Order Inquiry"
     body = response
-    
+
     # Try to extract subject if present
     import re
+
     subject_match = re.search(r"Subject:\s*(.+)", response, re.IGNORECASE)
     if subject_match:
         subject = subject_match.group(1).strip()
         body = response.replace(subject_match.group(0), "").strip()
 
-    return {
-        "vendor_email": vendor["email"] or "",
-        "subject": subject,
-        "body": body
-    }
+    return {"vendor_email": vendor["email"] or "", "subject": subject, "body": body}

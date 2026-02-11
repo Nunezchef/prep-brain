@@ -36,20 +36,19 @@ def resolve_recipe_by_name(
 ) -> Dict[str, Any]:
     con = memory.get_conn()
     try:
-        rows = con.execute(
-            """
-            SELECT id, name
+        rows = con.execute("""
+            SELECT id, name, COALESCE(is_active, 1) AS is_active
             FROM recipes
-            WHERE COALESCE(is_active, 1) = 1
             ORDER BY name ASC
-            """
-        ).fetchall()
+            """).fetchall()
     finally:
         con.close()
 
     scored: List[Dict[str, Any]] = []
     for row in rows:
         score = _score_name(query, str(row["name"] or ""))
+        if int(row["is_active"] or 0) == 1:
+            score += 0.01
         if score <= 0.0:
             continue
         scored.append(
@@ -57,6 +56,7 @@ def resolve_recipe_by_name(
                 "entity_type": "recipe",
                 "id": int(row["id"]),
                 "name": str(row["name"] or ""),
+                "is_active": int(row["is_active"] or 0),
                 "score": float(score),
             }
         )

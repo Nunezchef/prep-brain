@@ -73,6 +73,16 @@ python -m prep_brain.app
 streamlit run prep_brain/dashboard/app.py
 ```
 
+### Run (Docker)
+
+```bash
+./run_docker.sh
+```
+
+Notes:
+- Docker rebuilds the image when you run `./run_docker.sh` (`compose up --build`).
+- The compose stack now includes a dedicated `bot` service (autonomy + Telegram worker) plus dashboard API/frontend.
+
 ### Quality Gates
 
 ```bash

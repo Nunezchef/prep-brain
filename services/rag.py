@@ -22,16 +22,16 @@ from sentence_transformers import SentenceTransformer
 from services import memory
 from services.command_runner import CommandRunner
 from services.doc_extract import detect_images_in_docx, extract_docx_images, extract_text
-from prep_brain.config import load_config
+from prep_brain.config import load_config, resolve_path
 
 # Set up logging
 logger = logging.getLogger(__name__)
 
 # Constants
-PERSIST_DIRECTORY = "data/chroma_db"
+PERSIST_DIRECTORY = str(resolve_path("data/chroma_db"))
 COLLECTION_NAME = "prep_brain_knowledge"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-SOURCES_FILE = "data/sources.json"
+SOURCES_FILE = str(resolve_path("data/sources.json"))
 
 TIER_1_RECIPE_OPS = "tier1_recipe_ops"
 TIER_2_NOTES_SOPS = "tier2_notes_sops"
@@ -194,9 +194,7 @@ SECTION_NAME_ALIASES = {
 }
 METHOD_SECTION_KEYS = {"method", "instructions"}
 ACTION_SECTION_KEYS = {"grind and add", "finish", "for service"}
-INGREDIENT_LINE_RE = re.compile(
-    r"^\s*(?:[-•]\s*)?(?:\d+(?:\.\d+)?)\s*(?:[a-zA-Z#%]{1,12})\b"
-)
+INGREDIENT_LINE_RE = re.compile(r"^\s*(?:[-•]\s*)?(?:\d+(?:\.\d+)?)\s*(?:[a-zA-Z#%]{1,12})\b")
 STEP_LINE_RE = re.compile(r"^\s*\d+[\.)]\s+")
 
 
@@ -428,7 +426,13 @@ def _map_doc_source_type(source_type: str, knowledge_tier: str) -> str:
         return "general_knowledge"
     if lowered in {"general_knowledge_web"}:
         return "general_knowledge_web"
-    if lowered in {"house_recipe_book", "house_recipe_document", "house_recipe", "prep_notes", "vendor_list"}:
+    if lowered in {
+        "house_recipe_book",
+        "house_recipe_document",
+        "house_recipe",
+        "prep_notes",
+        "vendor_list",
+    }:
         return "restaurant_recipes"
     if knowledge_tier in {TIER_1_RECIPE_OPS, TIER_2_NOTES_SOPS}:
         return "restaurant_recipes"
@@ -481,14 +485,18 @@ class SmartChunker:
                             if not text:
                                 continue
 
-                            is_heading = (span.get("size", 0) > 14) or (text.isupper() and len(text) < 60)
+                            is_heading = (span.get("size", 0) > 14) or (
+                                text.isupper() and len(text) < 60
+                            )
 
                             if is_heading:
                                 if current_chunk and current_length > 100:
-                                    chunks.append({
-                                        "text": "\n".join(current_chunk),
-                                        "heading": current_heading,
-                                    })
+                                    chunks.append(
+                                        {
+                                            "text": "\n".join(current_chunk),
+                                            "heading": current_heading,
+                                        }
+                                    )
                                     current_chunk = []
                                     current_length = 0
 
@@ -500,19 +508,25 @@ class SmartChunker:
                                 current_length += len(text)
 
                                 if current_length > self.target_size:
-                                    chunks.append({
-                                        "text": "\n".join(current_chunk),
-                                        "heading": current_heading,
-                                    })
-                                    keep_lines = current_chunk[-3:] if len(current_chunk) > 3 else []
+                                    chunks.append(
+                                        {
+                                            "text": "\n".join(current_chunk),
+                                            "heading": current_heading,
+                                        }
+                                    )
+                                    keep_lines = (
+                                        current_chunk[-3:] if len(current_chunk) > 3 else []
+                                    )
                                     current_chunk = keep_lines
                                     current_length = sum(len(line) for line in keep_lines)
 
             if current_chunk:
-                chunks.append({
-                    "text": "\n".join(current_chunk),
-                    "heading": current_heading,
-                })
+                chunks.append(
+                    {
+                        "text": "\n".join(current_chunk),
+                        "heading": current_heading,
+                    }
+                )
 
             return chunks
         finally:
@@ -522,7 +536,7 @@ class SmartChunker:
 class RAGEngine:
     def __init__(self):
         Path(PERSIST_DIRECTORY).parent.mkdir(parents=True, exist_ok=True)
-        self.ingest_reports_dir = Path("data/ingest_reports")
+        self.ingest_reports_dir = resolve_path("data/ingest_reports")
         self.ingest_reports_dir.mkdir(parents=True, exist_ok=True)
         self.docx_ocr_runner = CommandRunner(allowed_commands={"tesseract"})
 
@@ -607,7 +621,9 @@ class RAGEngine:
     def list_ingest_reports(self, limit: int = 20) -> List[Dict[str, Any]]:
         if not self.ingest_reports_dir.exists():
             return []
-        files = sorted(self.ingest_reports_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        files = sorted(
+            self.ingest_reports_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True
+        )
         output: List[Dict[str, Any]] = []
         for file in files[: max(1, min(limit, 100))]:
             try:
@@ -635,7 +651,11 @@ class RAGEngine:
             except Exception:
                 return None
 
-        matches = sorted(self.ingest_reports_dir.glob(f"{needle}*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        matches = sorted(
+            self.ingest_reports_dir.glob(f"{needle}*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
         if not matches:
             return None
         try:
@@ -769,8 +789,10 @@ class RAGEngine:
                 ),
             )
 
-    def _extract_pdf_images(self, path: Path, source_id: str, max_images: int) -> List[Dict[str, Any]]:
-        images_dir = Path("data/extracted_images") / source_id
+    def _extract_pdf_images(
+        self, path: Path, source_id: str, max_images: int
+    ) -> List[Dict[str, Any]]:
+        images_dir = resolve_path("data/extracted_images") / source_id
         images_dir.mkdir(parents=True, exist_ok=True)
 
         doc = fitz.open(path)
@@ -821,7 +843,9 @@ class RAGEngine:
         vision_chunks: List[Dict[str, Any]] = []
 
         if not image_records:
-            warnings.append("Vision descriptions requested, but no images were available to describe.")
+            warnings.append(
+                "Vision descriptions requested, but no images were available to describe."
+            )
             return vision_chunks, warnings
 
         config = load_runtime_config()
@@ -836,7 +860,9 @@ class RAGEngine:
             )
             return vision_chunks, warnings
 
-        base_url = os.environ.get("OLLAMA_URL") or ollama_cfg.get("base_url", "http://localhost:11434")
+        base_url = os.environ.get("OLLAMA_URL") or ollama_cfg.get(
+            "base_url", "http://localhost:11434"
+        )
         prompt = vision_cfg.get(
             "prompt",
             "Describe the key operational and culinary information in this image.",
@@ -884,7 +910,7 @@ class RAGEngine:
 
     def _ocr_docx_images(self, path: Path, ingest_id: str) -> Tuple[str, int, List[str]]:
         warnings: List[str] = []
-        images_dir = Path("data/tmp/images") / ingest_id
+        images_dir = resolve_path("data/tmp/images") / ingest_id
         image_paths = extract_docx_images(str(path), str(images_dir))
         ocr_parts: List[str] = []
         ocr_ok = 0
@@ -952,7 +978,9 @@ class RAGEngine:
             return True
         return False
 
-    def _split_restaurant_recipe_blocks(self, text: str, default_heading: str) -> List[Tuple[str, List[str]]]:
+    def _split_restaurant_recipe_blocks(
+        self, text: str, default_heading: str
+    ) -> List[Tuple[str, List[str]]]:
         lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
         if not lines:
             return []
@@ -977,13 +1005,25 @@ class RAGEngine:
         # Merge heading-only fragments into the next block so chunks carry actual body content.
         merged: List[Tuple[str, List[str]]] = []
         idx = 0
-        section_markers = {"ingredients", "base", "method", "grind and add", "finish", "for service", "ratio"}
+        section_markers = {
+            "ingredients",
+            "base",
+            "method",
+            "grind and add",
+            "finish",
+            "for service",
+            "ratio",
+        }
         while idx < len(blocks):
             heading, body_lines = blocks[idx]
             payload = False
             for candidate in body_lines[1:]:
                 norm = _normalize_key(str(candidate).rstrip(":"))
-                if self._has_unit_hint(candidate) or norm in section_markers or STEP_LINE_RE.match(str(candidate)):
+                if (
+                    self._has_unit_hint(candidate)
+                    or norm in section_markers
+                    or STEP_LINE_RE.match(str(candidate))
+                ):
                     payload = True
                     break
             if not payload and idx + 1 < len(blocks):
@@ -1010,7 +1050,10 @@ class RAGEngine:
             return "IMAGE-RICH"
         if int(extracted_text_chars) >= 20000:
             return "TEXT-RICH"
-        if int(extracted_from_tables_chars) > int(extracted_from_paragraphs_chars) and int(extracted_from_tables_chars) > 0:
+        if (
+            int(extracted_from_tables_chars) > int(extracted_from_paragraphs_chars)
+            and int(extracted_from_tables_chars) > 0
+        ):
             return "TABLES-ONLY"
         return "LOW TEXT"
 
@@ -1026,7 +1069,13 @@ class RAGEngine:
     ) -> List[Dict[str, str]]:
         sections: List[Tuple[str, List[str]]] = []
         if pre_sections:
-            sections = [(str(h or heading), [str(line or "").strip() for line in body if str(line or "").strip()]) for h, body in pre_sections]
+            sections = [
+                (
+                    str(h or heading),
+                    [str(line or "").strip() for line in body if str(line or "").strip()],
+                )
+                for h, body in pre_sections
+            ]
         else:
             lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
             if not lines:
@@ -1073,7 +1122,13 @@ class RAGEngine:
             return []
 
         if not merge_short_chunks:
-            return [{"text": str(chunk.get("text") or "").strip(), "heading": str(chunk.get("heading") or heading)} for chunk in chunks]
+            return [
+                {
+                    "text": str(chunk.get("text") or "").strip(),
+                    "heading": str(chunk.get("heading") or heading),
+                }
+                for chunk in chunks
+            ]
 
         merged: List[Dict[str, str]] = []
         for chunk in chunks:
@@ -1137,7 +1192,9 @@ class RAGEngine:
                 "pre_dedupe_count": pre_count,
                 "post_dedupe_count": post_count,
                 "dedupe_key_strategy": "sha256(normalized_chunk_text)",
-                "top_repeated_hashes": [{"hash": key, "count": count} for key, count in top_repeated],
+                "top_repeated_hashes": [
+                    {"hash": key, "count": count} for key, count in top_repeated
+                ],
             },
             warnings,
         )
@@ -1224,7 +1281,13 @@ class RAGEngine:
             }
 
         target = _normalize_recipe_query_target(query_text) or str(query_text or "").strip()
-        candidate_names = sorted({str(entry.get("recipe_name") or "").strip() for entry in entries if entry.get("recipe_name")})
+        candidate_names = sorted(
+            {
+                str(entry.get("recipe_name") or "").strip()
+                for entry in entries
+                if entry.get("recipe_name")
+            }
+        )
         if not candidate_names:
             return {
                 "status": "incomplete",
@@ -1261,7 +1324,9 @@ class RAGEngine:
             for entry in entries
             if _normalize_key(str(entry.get("recipe_name") or "")) == _normalize_key(best_name)
         ]
-        selected.sort(key=lambda item: (int(item.get("chunk_id", 0)), int(item.get("order_index", 0))))
+        selected.sort(
+            key=lambda item: (int(item.get("chunk_id", 0)), int(item.get("order_index", 0)))
+        )
 
         section_order: List[str] = []
         section_lines: Dict[str, List[Tuple[str, str]]] = {}
@@ -1371,7 +1436,9 @@ class RAGEngine:
 
         sources_meta = self._load_sources()
         source_title_by_name = {
-            str(source.get("source_name") or ""): str(source.get("title") or source.get("source_name") or "")
+            str(source.get("source_name") or ""): str(
+                source.get("title") or source.get("source_name") or ""
+            )
             for source in sources_meta
         }
 
@@ -1396,7 +1463,9 @@ class RAGEngine:
                 if best_incomplete is None:
                     best_incomplete = assembled
                 else:
-                    score_now = float(assembled.get("confidence", 0.0)) + float(assembled.get("chunks_used", 0))
+                    score_now = float(assembled.get("confidence", 0.0)) + float(
+                        assembled.get("chunks_used", 0)
+                    )
                     score_best = float(best_incomplete.get("confidence", 0.0)) + float(
                         best_incomplete.get("chunks_used", 0)
                     )
@@ -1508,14 +1577,13 @@ class RAGEngine:
         dedupe_enabled = bool(chunk_cfg.get("dedupe_enabled", True))
         image_only_text_threshold = int(docx_cfg.get("image_only_text_threshold", 5000))
 
-        knowledge_tier = (
-            normalize_knowledge_tier(extra_metadata.get("knowledge_tier"))
-            or infer_knowledge_tier(
-                source_type=extra_metadata.get("source_type", "document"),
-                title=extra_metadata.get("source_title", path.stem),
-                source_name=path.name,
-                summary=extra_metadata.get("summary", ""),
-            )
+        knowledge_tier = normalize_knowledge_tier(
+            extra_metadata.get("knowledge_tier")
+        ) or infer_knowledge_tier(
+            source_type=extra_metadata.get("source_type", "document"),
+            title=extra_metadata.get("source_title", path.stem),
+            source_name=path.name,
+            summary=extra_metadata.get("summary", ""),
         )
         source_type_raw = str(extra_metadata.get("source_type", "unknown"))
         source_type = _map_doc_source_type(source_type_raw, knowledge_tier)
@@ -1640,8 +1708,12 @@ class RAGEngine:
                             "Ingestion blocked: this PDF appears image-heavy and requires OCR before indexing."
                         )
 
-                    temp_ocr_path = Path("data/tmp/ocr") / f"{path.stem}_{source_id[:8]}.pdf"
-                    ok, error_msg = self._run_ocr(path, temp_ocr_path, settings["ocr"].get("tool", "ocrmypdf"))
+                    temp_ocr_path = (
+                        resolve_path("data/tmp/ocr") / f"{path.stem}_{source_id[:8]}.pdf"
+                    )
+                    ok, error_msg = self._run_ocr(
+                        path, temp_ocr_path, settings["ocr"].get("tool", "ocrmypdf")
+                    )
                     if not ok:
                         raise RuntimeError(error_msg)
 
@@ -1658,7 +1730,10 @@ class RAGEngine:
             chunks_data: List[Dict[str, Any]] = []
             if is_pdf:
                 chunks = chunker.chunk_pdf(ocr_working_pdf)
-                chunks_data = [{"text": chunk["text"], "heading": chunk["heading"], "kind": "text"} for chunk in chunks]
+                chunks_data = [
+                    {"text": chunk["text"], "heading": chunk["heading"], "kind": "text"}
+                    for chunk in chunks
+                ]
                 extracted_text_chars = int(sum(len(chunk["text"]) for chunk in chunks_data))
                 report["extraction_metrics"]["extracted_text_chars"] = extracted_text_chars
                 report["extraction_metrics"]["extracted_text_lines"] = int(
@@ -1669,13 +1744,20 @@ class RAGEngine:
                 extracted_text_chars = len(extracted_text)
                 report["extraction_metrics"].update(metrics)
                 report["extraction_metrics"]["extracted_text_chars"] = extracted_text_chars
-                report["extraction_metrics"]["extracted_text_lines"] = len([line for line in extracted_text.splitlines() if line.strip()])
+                report["extraction_metrics"]["extracted_text_lines"] = len(
+                    [line for line in extracted_text.splitlines() if line.strip()]
+                )
 
-                embedded_image_count = int(metrics.get("embedded_image_count", detect_images_in_docx(str(path))))
-                tables_present_but_empty = int(metrics.get("docx_table_count", 0)) > 0 and int(
-                    metrics.get("extracted_from_tables_chars", 0)
-                ) == 0
-                likely_image_only = embedded_image_count > 0 and extracted_text_chars < image_only_text_threshold
+                embedded_image_count = int(
+                    metrics.get("embedded_image_count", detect_images_in_docx(str(path)))
+                )
+                tables_present_but_empty = (
+                    int(metrics.get("docx_table_count", 0)) > 0
+                    and int(metrics.get("extracted_from_tables_chars", 0)) == 0
+                )
+                likely_image_only = (
+                    embedded_image_count > 0 and extracted_text_chars < image_only_text_threshold
+                )
                 text_too_short = extracted_text_chars < image_only_text_threshold
                 report["extraction_metrics"]["warning_flags"] = {
                     "text_too_short": bool(text_too_short),
@@ -1683,7 +1765,9 @@ class RAGEngine:
                     "likely_image_only": bool(likely_image_only),
                 }
                 if tables_present_but_empty:
-                    warnings.append("tables_present_but_empty_extraction: docx_table_count>0 but extracted_from_tables_chars=0")
+                    warnings.append(
+                        "tables_present_but_empty_extraction: docx_table_count>0 but extracted_from_tables_chars=0"
+                    )
                 if text_too_short:
                     warnings.append(
                         f"text_too_short: extracted_text_chars={extracted_text_chars} threshold={image_only_text_threshold}"
@@ -1693,7 +1777,9 @@ class RAGEngine:
                         f"likely_image_only: embedded_image_count={embedded_image_count} extracted_text_chars={extracted_text_chars}"
                     )
 
-                if source_type == "restaurant_recipes" and (likely_image_only or (text_too_short and embedded_image_count > 0)):
+                if source_type == "restaurant_recipes" and (
+                    likely_image_only or (text_too_short and embedded_image_count > 0)
+                ):
                     ocr_text, ocr_images, ocr_warnings = self._ocr_docx_images(path, ingest_id)
                     warnings.extend(ocr_warnings)
                     if ocr_text:
@@ -1721,17 +1807,26 @@ class RAGEngine:
                     heading="DOCX Content",
                     chunk_size_chars=chunk_size_chars,
                     chunk_overlap_chars=chunk_overlap_chars,
-                    minimum_chunk_chars=120 if source_type == "restaurant_recipes" else minimum_chunk_chars,
+                    minimum_chunk_chars=(
+                        120 if source_type == "restaurant_recipes" else minimum_chunk_chars
+                    ),
                     merge_short_chunks=False if source_type == "restaurant_recipes" else True,
                     pre_sections=recipe_sections if recipe_sections else None,
                 )
-                chunks_data = [{"text": chunk["text"], "heading": chunk["heading"], "kind": "text"} for chunk in text_chunks]
+                chunks_data = [
+                    {"text": chunk["text"], "heading": chunk["heading"], "kind": "text"}
+                    for chunk in text_chunks
+                ]
             else:
                 text = path.read_text(encoding="utf-8", errors="replace")
                 extracted_text_chars = len(text)
                 report["extraction_metrics"]["extracted_text_chars"] = extracted_text_chars
-                report["extraction_metrics"]["extracted_text_lines"] = len([line for line in text.splitlines() if line.strip()])
-                report["extraction_metrics"]["extracted_from_paragraphs_chars"] = extracted_text_chars
+                report["extraction_metrics"]["extracted_text_lines"] = len(
+                    [line for line in text.splitlines() if line.strip()]
+                )
+                report["extraction_metrics"][
+                    "extracted_from_paragraphs_chars"
+                ] = extracted_text_chars
                 text_chunks = self._chunk_text_blocks(
                     text,
                     heading="General",
@@ -1739,7 +1834,10 @@ class RAGEngine:
                     chunk_overlap_chars=chunk_overlap_chars,
                     minimum_chunk_chars=minimum_chunk_chars,
                 )
-                chunks_data = [{"text": chunk["text"], "heading": chunk["heading"], "kind": "text"} for chunk in text_chunks]
+                chunks_data = [
+                    {"text": chunk["text"], "heading": chunk["heading"], "kind": "text"}
+                    for chunk in text_chunks
+                ]
 
             if not chunks_data:
                 raise RuntimeError("Extraction yielded no text chunks.")
@@ -1747,22 +1845,34 @@ class RAGEngine:
             if is_pdf and options["extract_images"]:
                 pipeline["image_extraction"] = "applied"
                 max_images = int(image_cfg.get("max_images", 30))
-                extracted_images = self._extract_pdf_images(ocr_working_pdf, source_id, max_images=max_images)
+                extracted_images = self._extract_pdf_images(
+                    ocr_working_pdf, source_id, max_images=max_images
+                )
                 if not extracted_images:
                     warnings.append("image_extraction_enabled_but_none_found")
 
             if is_pdf and options["vision_descriptions"]:
                 pipeline["vision_descriptions"] = "applied"
-                vision_chunks, vision_warnings = self._vision_descriptions(extracted_images, settings)
+                vision_chunks, vision_warnings = self._vision_descriptions(
+                    extracted_images, settings
+                )
                 chunks_data.extend(vision_chunks)
                 warnings.extend(vision_warnings)
 
-            pre_lengths = [len(str(item.get("text") or "")) for item in chunks_data if str(item.get("text") or "").strip()]
+            pre_lengths = [
+                len(str(item.get("text") or ""))
+                for item in chunks_data
+                if str(item.get("text") or "").strip()
+            ]
             produced_chunk_count = len(pre_lengths)
             report["chunking_metrics"].update(
                 {
                     "produced_chunk_count": produced_chunk_count,
-                    "avg_chunk_chars": round(sum(pre_lengths) / produced_chunk_count, 2) if produced_chunk_count else 0.0,
+                    "avg_chunk_chars": (
+                        round(sum(pre_lengths) / produced_chunk_count, 2)
+                        if produced_chunk_count
+                        else 0.0
+                    ),
                     "min_chunk_chars": min(pre_lengths) if pre_lengths else 0,
                     "max_chunk_chars": max(pre_lengths) if pre_lengths else 0,
                     "pre_dedupe_chunk_samples": [
@@ -1833,7 +1943,9 @@ class RAGEngine:
                 )
 
             report["vector_store_metrics"]["attempted_add_count"] = len(documents)
-            report["vector_store_metrics"]["metadata_fields_stored"] = list(metadatas[0].keys()) if metadatas else []
+            report["vector_store_metrics"]["metadata_fields_stored"] = (
+                list(metadatas[0].keys()) if metadatas else []
+            )
 
             try:
                 self.collection.delete(where={"source": path.name})
@@ -1848,9 +1960,17 @@ class RAGEngine:
             sources = self._load_sources()
             sources = [source for source in sources if source["source_name"] != path.name]
 
-            extracted_image_dir = str((Path("data/extracted_images") / source_id).resolve()) if extracted_images else ""
-            extracted_from_tables_chars = int(report["extraction_metrics"].get("extracted_from_tables_chars", 0))
-            extracted_from_paragraphs_chars = int(report["extraction_metrics"].get("extracted_from_paragraphs_chars", 0))
+            extracted_image_dir = (
+                str((resolve_path("data/extracted_images") / source_id).resolve())
+                if extracted_images
+                else ""
+            )
+            extracted_from_tables_chars = int(
+                report["extraction_metrics"].get("extracted_from_tables_chars", 0)
+            )
+            extracted_from_paragraphs_chars = int(
+                report["extraction_metrics"].get("extracted_from_paragraphs_chars", 0)
+            )
             text_profile = self._derive_text_profile_label(
                 extracted_text_chars=int(extracted_text_chars),
                 extracted_from_tables_chars=extracted_from_tables_chars,
@@ -1882,15 +2002,25 @@ class RAGEngine:
                 "images_extracted": len(extracted_images),
                 "extracted_image_dir": extracted_image_dir,
                 "vision_descriptions_enabled": bool(options["vision_descriptions"]),
-                "vision_descriptions_count": len([chunk for chunk in chunks_data if chunk.get("kind") == "vision"]),
+                "vision_descriptions_count": len(
+                    [chunk for chunk in chunks_data if chunk.get("kind") == "vision"]
+                ),
                 "extracted_text_chars": int(extracted_text_chars),
-                "extracted_text_lines": int(report["extraction_metrics"].get("extracted_text_lines", 0)),
-                "docx_paragraph_count": int(report["extraction_metrics"].get("docx_paragraph_count", 0)),
+                "extracted_text_lines": int(
+                    report["extraction_metrics"].get("extracted_text_lines", 0)
+                ),
+                "docx_paragraph_count": int(
+                    report["extraction_metrics"].get("docx_paragraph_count", 0)
+                ),
                 "docx_table_count": int(report["extraction_metrics"].get("docx_table_count", 0)),
-                "docx_table_cell_count": int(report["extraction_metrics"].get("docx_table_cell_count", 0)),
+                "docx_table_cell_count": int(
+                    report["extraction_metrics"].get("docx_table_cell_count", 0)
+                ),
                 "extracted_from_tables_chars": extracted_from_tables_chars,
                 "extracted_from_paragraphs_chars": extracted_from_paragraphs_chars,
-                "embedded_image_count": int(report["extraction_metrics"].get("embedded_image_count", 0)),
+                "embedded_image_count": int(
+                    report["extraction_metrics"].get("embedded_image_count", 0)
+                ),
                 "text_profile_label": text_profile,
                 "ingestion_pipeline": pipeline,
                 "warnings": warnings,
@@ -1945,7 +2075,9 @@ class RAGEngine:
             logger.exception("Error ingesting %s", file_path)
             report["status"] = "failed"
             report["error"] = error_text
-            report["vector_store_metrics"]["error_count"] = int(report["vector_store_metrics"].get("error_count", 0)) + 1
+            report["vector_store_metrics"]["error_count"] = (
+                int(report["vector_store_metrics"].get("error_count", 0)) + 1
+            )
             self._persist_doc_source(
                 ingest_id=ingest_id,
                 filename=path.name,
@@ -1984,7 +2116,9 @@ class RAGEngine:
                 and source.get("collection_name", COLLECTION_NAME) == COLLECTION_NAME
             ]
             requested_tiers = [
-                tier for tier in (normalize_knowledge_tier(value) for value in (source_tiers or [])) if tier
+                tier
+                for tier in (normalize_knowledge_tier(value) for value in (source_tiers or []))
+                if tier
             ]
             if requested_tiers:
                 requested_set = set(requested_tiers)
@@ -2072,7 +2206,9 @@ class RAGEngine:
                             "order_index": metadata.get("order_index", metadata.get("chunk_id", i)),
                             "knowledge_tier": metadata.get(
                                 "knowledge_tier",
-                                source_tier_by_name.get(metadata.get("source", ""), TIER_1_RECIPE_OPS),
+                                source_tier_by_name.get(
+                                    metadata.get("source", ""), TIER_1_RECIPE_OPS
+                                ),
                             ),
                         }
                     )

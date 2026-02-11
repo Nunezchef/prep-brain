@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from services import brain, costing, memory, notifier, prep_list, rag, recipes
 from services.web_research import WebResearchClient
-from prep_brain.config import load_config
+from prep_brain.config import load_config, resolve_path
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,13 @@ def _sanitize_error_text(raw: Any, limit: int = 400) -> str:
 def normalize_job_source_type(source_type: str, knowledge_tier: Optional[str] = None) -> str:
     st = str(source_type or "").strip().lower()
     tier = rag.normalize_knowledge_tier(knowledge_tier)
-    if st in {"restaurant_recipes", "house_recipe_book", "house_recipe_document", "house_recipe", "prep_notes"}:
+    if st in {
+        "restaurant_recipes",
+        "house_recipe_book",
+        "house_recipe_document",
+        "house_recipe",
+        "prep_notes",
+    }:
         return "restaurant_recipes"
     if st in {"general_knowledge", "reference_book"}:
         return "general_knowledge"
@@ -87,7 +93,7 @@ def queue_ingest_job(
 ) -> Dict[str, Any]:
     ingest_id = uuid.uuid4().hex
     normalized_type = normalize_job_source_type(source_type)
-    file_path = Path("data/documents") / str(source_filename or "").strip()
+    file_path = resolve_path("data/documents") / str(source_filename or "").strip()
     file_size = int(file_path.stat().st_size) if file_path.exists() else 0
     file_sha256 = ""
     if file_path.exists():
@@ -215,25 +221,35 @@ class AutonomyWorker:
         default_enrich_min = 0.60 if self.mode == "balanced" else 0.65
 
         self.enabled = bool(autonomy_cfg.get("enabled", True))
-        self.interval = int(autonomy_cfg.get("cycle_interval_seconds", 2700 if self.mode == "balanced" else 1800))
+        self.interval = int(
+            autonomy_cfg.get("cycle_interval_seconds", 2700 if self.mode == "balanced" else 1800)
+        )
         self.poll_interval_seconds = int(autonomy_cfg.get("poll_interval_seconds", 300))
         self.telegram_alerts = bool(autonomy_cfg.get("telegram_alerts", False))
         self.ingest_completion_message = bool(autonomy_cfg.get("ingest_completion_message", False))
         self.alert_cooldown_minutes = int(autonomy_cfg.get("alert_cooldown_minutes", 180))
-        self.auto_promote_threshold = float(autonomy_cfg.get("auto_promote_threshold", default_promote_threshold))
-        self.enrich_min_confidence = float(autonomy_cfg.get("enrich_min_confidence", default_enrich_min))
+        self.auto_promote_threshold = float(
+            autonomy_cfg.get("auto_promote_threshold", default_promote_threshold)
+        )
+        self.enrich_min_confidence = float(
+            autonomy_cfg.get("enrich_min_confidence", default_enrich_min)
+        )
         self.enrich_attempt_band_max = float(
             autonomy_cfg.get("enrich_attempt_band_max", self.auto_promote_threshold - 0.01)
         )
         self.draft_scan_limit = int(autonomy_cfg.get("draft_scan_limit", 10))
         self.max_source_chunks_per_draft = int(autonomy_cfg.get("max_source_chunks_per_draft", 12))
         self.min_source_chars_for_draft = int(autonomy_cfg.get("min_source_chars_for_draft", 300))
-        web_cfg = autonomy_cfg.get("web", {}) if isinstance(autonomy_cfg.get("web", {}), dict) else {}
+        web_cfg = (
+            autonomy_cfg.get("web", {}) if isinstance(autonomy_cfg.get("web", {}), dict) else {}
+        )
         self.web_enabled = bool(web_cfg.get("enabled", False))
         self.web_mode = str(web_cfg.get("mode", "research_only")).strip().lower()
         self.web_rate_limit_rps = float(web_cfg.get("rate_limit_rps", 0.5))
         self.web_max_pages_per_task = int(web_cfg.get("max_pages_per_task", 3))
-        self.web_allowed_domains = [str(d).strip() for d in web_cfg.get("allowed_domains", []) if str(d).strip()]
+        self.web_allowed_domains = [
+            str(d).strip() for d in web_cfg.get("allowed_domains", []) if str(d).strip()
+        ]
 
         self.running = False
         self._stop_event = asyncio.Event()
@@ -242,7 +258,7 @@ class AutonomyWorker:
         self._is_tick_running = False
         self.web_client: Optional[WebResearchClient] = None
         self._lock_handle = None
-        self._lock_path = Path("run/autonomy.singleton.lock")
+        self._lock_path = resolve_path("run/autonomy.singleton.lock")
         self._singleton_owner = False
 
         # Ensure required tables exist even when worker runs standalone.
@@ -416,7 +432,9 @@ class AutonomyWorker:
         finally:
             con.close()
 
-    def _classify_needs_review_reason(self, *, report: Optional[Dict[str, Any]], source_type: str) -> str:
+    def _classify_needs_review_reason(
+        self, *, report: Optional[Dict[str, Any]], source_type: str
+    ) -> str:
         if source_type != "restaurant_recipes":
             return "classified_as_general_knowledge"
         if not report:
@@ -546,14 +564,13 @@ class AutonomyWorker:
 
         source = source_index.get(draft.get("source_id"))
         if source:
-            source_tier = (
-                rag.normalize_knowledge_tier(source.get("knowledge_tier"))
-                or rag.infer_knowledge_tier(
-                    source_type=source.get("type", ""),
-                    title=source.get("title", ""),
-                    source_name=source.get("source_name", ""),
-                    summary=source.get("summary", ""),
-                )
+            source_tier = rag.normalize_knowledge_tier(
+                source.get("knowledge_tier")
+            ) or rag.infer_knowledge_tier(
+                source_type=source.get("type", ""),
+                title=source.get("title", ""),
+                source_name=source.get("source_name", ""),
+                summary=source.get("summary", ""),
             )
             if source_tier:
                 return source_tier
@@ -741,12 +758,18 @@ class AutonomyWorker:
         if source_type in {"house_recipe_book", "house_recipe_document", "house_recipe"}:
             return True
 
-        if any(token in haystack for token in ("vendor", "invoice", "price list", "catalog", "order guide")):
+        if any(
+            token in haystack
+            for token in ("vendor", "invoice", "price list", "catalog", "order guide")
+        ):
             return False
         if any(token in haystack for token in ("reference", "theory", "mcgee", "flavor bible")):
             return False
 
-        return any(token in haystack for token in ("recipe", "dish", "prep recipe", "line recipe", "yield", "method"))
+        return any(
+            token in haystack
+            for token in ("recipe", "dish", "prep recipe", "line recipe", "yield", "method")
+        )
 
     def _has_recent_price_estimate(self, con, item_name: str, hours: int = 24) -> bool:
         row = con.execute(
@@ -827,8 +850,7 @@ class AutonomyWorker:
 
         estimated = 0
         seen: Set[str] = set()
-        rows = con.execute(
-            """
+        rows = con.execute("""
             SELECT
                 ri.id AS ingredient_id,
                 ri.item_name_text,
@@ -837,8 +859,7 @@ class AutonomyWorker:
                 ii.cost AS inventory_cost
             FROM recipe_ingredients ri
             LEFT JOIN inventory_items ii ON ri.inventory_item_id = ii.id
-            """
-        ).fetchall()
+            """).fetchall()
 
         for row in rows:
             ingredient_name = str(row["inventory_name"] or row["item_name_text"] or "").strip()
@@ -850,7 +871,9 @@ class AutonomyWorker:
                 continue
             seen.add(key)
 
-            if self._has_authoritative_cost(con, ingredient_name, _safe_float(row["inventory_cost"])):
+            if self._has_authoritative_cost(
+                con, ingredient_name, _safe_float(row["inventory_cost"])
+            ):
                 continue
             if self._has_recent_price_estimate(con, ingredient_name, hours=24):
                 continue
@@ -971,14 +994,13 @@ class AutonomyWorker:
                 if not source_id or not source_name:
                     continue
 
-                tier = (
-                    rag.normalize_knowledge_tier(source.get("knowledge_tier"))
-                    or rag.infer_knowledge_tier(
-                        source_type=source.get("type", ""),
-                        title=source.get("title", ""),
-                        source_name=source_name,
-                        summary=source.get("summary", ""),
-                    )
+                tier = rag.normalize_knowledge_tier(
+                    source.get("knowledge_tier")
+                ) or rag.infer_knowledge_tier(
+                    source_type=source.get("type", ""),
+                    title=source.get("title", ""),
+                    source_name=source_name,
+                    summary=source.get("summary", ""),
                 )
                 if tier != rag.TIER_1_RECIPE_OPS:
                     continue
@@ -1017,7 +1039,11 @@ class AutonomyWorker:
                     if not text:
                         continue
 
-                    metadata = metadatas[idx] if idx < len(metadatas) and isinstance(metadatas[idx], dict) else {}
+                    metadata = (
+                        metadatas[idx]
+                        if idx < len(metadatas) and isinstance(metadatas[idx], dict)
+                        else {}
+                    )
                     try:
                         chunk_id = int(metadata.get("chunk_id", idx))
                     except Exception:
@@ -1037,7 +1063,9 @@ class AutonomyWorker:
                 draft_name = " ".join(
                     str(source.get("title") or Path(source_name).stem or "Untitled Draft").split()
                 ).strip()
-                confidence = min(self._estimate_draft_confidence(raw_text), self.enrich_attempt_band_max)
+                confidence = min(
+                    self._estimate_draft_confidence(raw_text), self.enrich_attempt_band_max
+                )
 
                 con.execute(
                     """
@@ -1191,7 +1219,9 @@ class AutonomyWorker:
                     parsed = self._extract_json_object(response_text)
                     ingredients = self._sanitize_ingredients(parsed.get("ingredients"))
                     allergens_list = self._sanitize_allergens(parsed.get("allergens"))
-                    name_value = " ".join(str(parsed.get("name") or draft["name"]).split()).strip() or None
+                    name_value = (
+                        " ".join(str(parsed.get("name") or draft["name"]).split()).strip() or None
+                    )
                     method_value = str(parsed.get("method") or "").strip() or None
                     missing_required = self._missing_required_fields(
                         name_value=name_value,
@@ -1199,7 +1229,9 @@ class AutonomyWorker:
                         ingredients=ingredients,
                     )
                     if missing_required:
-                        raise ValueError(f"Missing required field(s): {', '.join(missing_required)}")
+                        raise ValueError(
+                            f"Missing required field(s): {', '.join(missing_required)}"
+                        )
 
                     confidence_after = self._structured_confidence(
                         before=confidence_before,
@@ -1291,7 +1323,9 @@ class AutonomyWorker:
 
         db_rows = con.execute("SELECT id, name FROM allergens").fetchall()
         id_by_name = {str(row["name"]).strip().lower(): int(row["id"]) for row in db_rows}
-        allergen_ids = [id_by_name[name.lower()] for name in candidate_names if name.lower() in id_by_name]
+        allergen_ids = [
+            id_by_name[name.lower()] for name in candidate_names if name.lower() in id_by_name
+        ]
         if not allergen_ids:
             return
 
@@ -1323,7 +1357,9 @@ class AutonomyWorker:
                 draft_id = draft["id"]
                 tier = self._resolve_draft_tier(draft=draft, source_index=source_index)
                 if tier != rag.TIER_1_RECIPE_OPS:
-                    reason = "Knowledge boundary enforced: non-Tier-1 draft cannot be auto-promoted."
+                    reason = (
+                        "Knowledge boundary enforced: non-Tier-1 draft cannot be auto-promoted."
+                    )
                     con.execute(
                         """
                         UPDATE recipe_drafts
@@ -1513,13 +1549,11 @@ class AutonomyWorker:
                 if norm_key:
                     normalized_map.setdefault(norm_key, []).append(item_id)
 
-            unlinked_rows = con.execute(
-                """
+            unlinked_rows = con.execute("""
                 SELECT id, item_name_text, recipe_id
                 FROM recipe_ingredients
                 WHERE inventory_item_id IS NULL AND item_name_text IS NOT NULL
-                """
-            ).fetchall()
+                """).fetchall()
 
             touched_recipes: Set[int] = set()
             for row in unlinked_rows:
@@ -1581,29 +1615,23 @@ class AutonomyWorker:
         """Detect critical recipe data gaps and alert only when intervention is required."""
         con = memory.get_conn()
         try:
-            empty_recipes = con.execute(
-                """
+            empty_recipes = con.execute("""
                 SELECT r.id, r.name
                 FROM recipes r
                 LEFT JOIN recipe_ingredients ri ON r.id = ri.recipe_id
                 WHERE ri.id IS NULL AND r.is_active = 1
-                """
-            ).fetchall()
+                """).fetchall()
 
-            no_yield_recipes = con.execute(
-                """
+            no_yield_recipes = con.execute("""
                 SELECT id, name
                 FROM recipes
                 WHERE (yield_amount IS NULL OR yield_amount = 0) AND is_active = 1
-                """
-            ).fetchall()
-            no_method_recipes = con.execute(
-                """
+                """).fetchall()
+            no_method_recipes = con.execute("""
                 SELECT id, name
                 FROM recipes
                 WHERE (method IS NULL OR TRIM(method) = '') AND is_active = 1
-                """
-            ).fetchall()
+                """).fetchall()
 
             for row in empty_recipes:
                 recipe_id = str(row["id"])
@@ -1662,13 +1690,11 @@ class AutonomyWorker:
         updated = 0
         try:
             source_index = self._build_source_index()
-            drafts = con.execute(
-                """
+            drafts = con.execute("""
                 SELECT id, source_id, name, raw_text, knowledge_tier
                 FROM recipe_drafts
                 WHERE status IN ('pending','enriched') OR knowledge_tier IS NULL OR TRIM(knowledge_tier) = ''
-                """
-            ).fetchall()
+                """).fetchall()
 
             for draft_row in drafts:
                 draft = dict(draft_row)
@@ -1703,7 +1729,7 @@ class AutonomyWorker:
         source_type = str(job.get("source_type") or "unknown").strip().lower()
         restaurant_tag = str(job.get("restaurant_tag") or "").strip() or None
 
-        file_path = Path("data/documents") / source_filename
+        file_path = resolve_path("data/documents") / source_filename
         if not file_path.exists():
             self._update_ingest_job(
                 job_id,
@@ -1724,12 +1750,20 @@ class AutonomyWorker:
             )
             return
 
-        self._update_ingest_job(job_id, status="extracting", progress_current=1, progress_total=6, started=True)
+        self._update_ingest_job(
+            job_id, status="extracting", progress_current=1, progress_total=6, started=True
+        )
         self._set_status(last_action="extracting")
 
         source_title = file_path.stem.replace("_", " ").title()
-        metadata_type = "house_recipe_book" if source_type == "restaurant_recipes" else "reference_book"
-        knowledge_tier = rag.TIER_1_RECIPE_OPS if source_type == "restaurant_recipes" else rag.TIER_3_REFERENCE_THEORY
+        metadata_type = (
+            "house_recipe_book" if source_type == "restaurant_recipes" else "reference_book"
+        )
+        knowledge_tier = (
+            rag.TIER_1_RECIPE_OPS
+            if source_type == "restaurant_recipes"
+            else rag.TIER_3_REFERENCE_THEORY
+        )
 
         self._update_ingest_job(job_id, status="chunking", progress_current=2, progress_total=6)
         self._set_status(last_action="chunking")
@@ -1774,7 +1808,9 @@ class AutonomyWorker:
             report = rag.rag_engine.load_ingest_report(ingest_id)
 
         if source_type != "restaurant_recipes":
-            self._update_ingest_job(job_id, status="done", progress_current=6, progress_total=6, finished=True)
+            self._update_ingest_job(
+                job_id, status="done", progress_current=6, progress_total=6, finished=True
+            )
             self._set_status(last_action="ingest_done_reference")
             return
 
@@ -1791,7 +1827,9 @@ class AutonomyWorker:
         finally:
             con.close()
 
-        self._update_ingest_job(job_id, status="extracting_recipes", progress_current=4, progress_total=6)
+        self._update_ingest_job(
+            job_id, status="extracting_recipes", progress_current=4, progress_total=6
+        )
         self._set_status(last_action="extracting_recipes")
         await self.evaluate_documents()
 
@@ -1831,7 +1869,9 @@ class AutonomyWorker:
             needs_review_count = max(0, total_for_source - promoted_after) if source_id else 0
 
             if promoted_count == 0:
-                reason_code = self._classify_needs_review_reason(report=report, source_type=source_type)
+                reason_code = self._classify_needs_review_reason(
+                    report=report, source_type=source_type
+                )
                 self._update_ingest_job(
                     job_id,
                     status="needs_review",
@@ -1921,7 +1961,9 @@ class AutonomyWorker:
 
         self._is_tick_running = True
         try:
-            self._set_status(is_running=1, last_tick_at=datetime.now().isoformat(), last_action="tick")
+            self._set_status(
+                is_running=1, last_tick_at=datetime.now().isoformat(), last_action="tick"
+            )
             self._refresh_status_queues(action="tick")
 
             jobs_processed = await self.process_ingest_jobs(limit=2)
@@ -1990,7 +2032,9 @@ class AutonomyWorker:
     async def start(self):
         if not self.enabled:
             logger.info("Autonomy is disabled in config. Running silent.")
-            self._set_status(is_running=0, last_action="disabled", last_tick_at=datetime.now().isoformat())
+            self._set_status(
+                is_running=0, last_action="disabled", last_tick_at=datetime.now().isoformat()
+            )
             return
 
         if not self._acquire_singleton():
@@ -1998,7 +2042,9 @@ class AutonomyWorker:
             return
 
         self.running = True
-        self._set_status(is_running=1, last_action="started", last_tick_at=datetime.now().isoformat())
+        self._set_status(
+            is_running=1, last_action="started", last_tick_at=datetime.now().isoformat()
+        )
         logger.info(
             "Autonomy worker started. Poll interval: %ss (maintenance interval: %ss)",
             self.poll_interval_seconds,
@@ -2009,18 +2055,24 @@ class AutonomyWorker:
             while not self._stop_event.is_set():
                 await self.run_background_tick()
                 try:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=max(30, self.poll_interval_seconds))
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=max(30, self.poll_interval_seconds)
+                    )
                 except asyncio.TimeoutError:
                     continue
         finally:
             self.running = False
-            self._set_status(is_running=0, last_action="stopped", last_tick_at=datetime.now().isoformat())
+            self._set_status(
+                is_running=0, last_action="stopped", last_tick_at=datetime.now().isoformat()
+            )
             self._release_singleton()
 
     def stop(self):
         self.running = False
         self._stop_event.set()
-        self._set_status(is_running=0, last_action="stopping", last_tick_at=datetime.now().isoformat())
+        self._set_status(
+            is_running=0, last_action="stopping", last_tick_at=datetime.now().isoformat()
+        )
         logger.info("Autonomy worker stopping...")
 
 

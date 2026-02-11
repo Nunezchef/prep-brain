@@ -19,4 +19,9 @@ else
     echo "Ollama is already running."
 fi
 
-docker-compose up --build
+mkdir -p run
+if command -v docker-compose &> /dev/null; then
+    docker-compose up --build
+else
+    docker compose up --build
+fi

@@ -14,17 +14,22 @@ DB_PATH = _configured_db_path()
 def get_db_path() -> Path:
     return DB_PATH
 
+
 def get_conn() -> sqlite3.Connection:
     """Get a database connection."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=30.0)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA foreign_keys=ON;")
+    con.execute("PRAGMA busy_timeout=30000;")
+    con.execute("PRAGMA synchronous=NORMAL;")
     return con
+
 
 def _conn() -> sqlite3.Connection:
     return get_conn()
+
 
 def init_db() -> None:
     con = _conn()
@@ -245,9 +250,11 @@ def init_db() -> None:
     # SQLite `PRAGMA table_info` gives us columns.
     cur.execute("PRAGMA table_info(inventory_items)")
     columns = [row[1] for row in cur.fetchall()]
-    
+
     if "storage_area_id" not in columns:
-        cur.execute("ALTER TABLE inventory_items ADD COLUMN storage_area_id INTEGER REFERENCES storage_areas(id)")
+        cur.execute(
+            "ALTER TABLE inventory_items ADD COLUMN storage_area_id INTEGER REFERENCES storage_areas(id)"
+        )
     if "category" not in columns:
         cur.execute("ALTER TABLE inventory_items ADD COLUMN category TEXT")
     if "sort_order" not in columns:
@@ -303,7 +310,17 @@ def init_db() -> None:
     """)
 
     # Pre-populate allergens (Big 9)
-    big_9 = ["Milk", "Eggs", "Fish", "Shellfish", "Tree Nuts", "Peanuts", "Wheat", "Soybeans", "Sesame"]
+    big_9 = [
+        "Milk",
+        "Eggs",
+        "Fish",
+        "Shellfish",
+        "Tree Nuts",
+        "Peanuts",
+        "Wheat",
+        "Soybeans",
+        "Sesame",
+    ]
     for a in big_9:
         cur.execute("INSERT OR IGNORE INTO allergens (name) VALUES (?)", (a,))
 
@@ -388,10 +405,20 @@ def init_db() -> None:
     # Ensure recipes has new columns (Migration)
     cur.execute("PRAGMA table_info(recipes)")
     recipe_cols = [row[1] for row in cur.fetchall()]
+    if "station" not in recipe_cols:
+        cur.execute("ALTER TABLE recipes ADD COLUMN station TEXT")
+    if "method" not in recipe_cols:
+        cur.execute("ALTER TABLE recipes ADD COLUMN method TEXT")
+    if "yield_amount" not in recipe_cols:
+        cur.execute("ALTER TABLE recipes ADD COLUMN yield_amount REAL")
+    if "yield_unit" not in recipe_cols:
+        cur.execute("ALTER TABLE recipes ADD COLUMN yield_unit TEXT")
     if "par_level" not in recipe_cols:
         cur.execute("ALTER TABLE recipes ADD COLUMN par_level REAL DEFAULT 0.0")
     if "output_inventory_item_id" not in recipe_cols:
-        cur.execute("ALTER TABLE recipes ADD COLUMN output_inventory_item_id INTEGER REFERENCES inventory_items(id)")
+        cur.execute(
+            "ALTER TABLE recipes ADD COLUMN output_inventory_item_id INTEGER REFERENCES inventory_items(id)"
+        )
     if "sales_price" not in recipe_cols:
         cur.execute("ALTER TABLE recipes ADD COLUMN sales_price REAL DEFAULT 0")
     if "recent_sales_count" not in recipe_cols:
@@ -402,6 +429,22 @@ def init_db() -> None:
         cur.execute("ALTER TABLE recipes ADD COLUMN unit TEXT")
     if "updated_at" not in recipe_cols:
         cur.execute("ALTER TABLE recipes ADD COLUMN updated_at TEXT")
+    # Backfill compatibility columns when older schema stores method as instructions.
+    if "instructions" in recipe_cols:
+        cur.execute("""
+            UPDATE recipes
+            SET method = COALESCE(method, instructions)
+            WHERE method IS NULL
+            """)
+    if "station_id" in recipe_cols:
+        cur.execute("""
+            UPDATE recipes
+            SET station = COALESCE(
+                station,
+                (SELECT s.name FROM stations s WHERE s.id = recipes.station_id)
+            )
+            WHERE station IS NULL
+            """)
 
     # 86 Board
     cur.execute("""
@@ -499,7 +542,9 @@ def init_db() -> None:
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_entity_time ON audit_events(entity_type, entity_id, created_at)")
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_entity_time ON audit_events(entity_type, entity_id, created_at)"
+    )
 
     # Autonomy heartbeat/state (single-row table; id=1).
     cur.execute("""
@@ -544,7 +589,9 @@ def init_db() -> None:
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ingest_jobs_status_updated ON ingest_jobs(status, updated_at)")
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ingest_jobs_status_updated ON ingest_jobs(status, updated_at)"
+    )
 
     # Web-derived pricing estimates (non-authoritative)
     cur.execute("""
@@ -559,13 +606,17 @@ def init_db() -> None:
         retrieved_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_price_estimates_item_time ON price_estimates(item_name, retrieved_at)")
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_price_estimates_item_time ON price_estimates(item_name, retrieved_at)"
+    )
 
     # Migration safety for older schema revisions.
     cur.execute("PRAGMA table_info(price_estimates)")
     pe_columns = [row[1] for row in cur.fetchall()]
     if pe_columns and "knowledge_tier" not in pe_columns:
-        cur.execute("ALTER TABLE price_estimates ADD COLUMN knowledge_tier TEXT DEFAULT 'general_knowledge_web'")
+        cur.execute(
+            "ALTER TABLE price_estimates ADD COLUMN knowledge_tier TEXT DEFAULT 'general_knowledge_web'"
+        )
     if pe_columns and "retrieved_at" not in pe_columns:
         cur.execute("ALTER TABLE price_estimates ADD COLUMN retrieved_at TEXT")
     if pe_columns:
@@ -707,7 +758,9 @@ def init_db() -> None:
     cur.execute("PRAGMA table_info(prep_list_items)")
     prep_cols = [row[1] for row in cur.fetchall()]
     if "station_id" not in prep_cols:
-        cur.execute("ALTER TABLE prep_list_items ADD COLUMN station_id INTEGER REFERENCES stations(id)")
+        cur.execute(
+            "ALTER TABLE prep_list_items ADD COLUMN station_id INTEGER REFERENCES stations(id)"
+        )
     if "target_quantity" not in prep_cols:
         cur.execute("ALTER TABLE prep_list_items ADD COLUMN target_quantity REAL")
     if "completed_quantity" not in prep_cols:
@@ -715,23 +768,25 @@ def init_db() -> None:
     if "display_unit" not in prep_cols:
         cur.execute("ALTER TABLE prep_list_items ADD COLUMN display_unit TEXT")
     if "assigned_staff_id" not in prep_cols:
-        cur.execute("ALTER TABLE prep_list_items ADD COLUMN assigned_staff_id INTEGER REFERENCES staff(id)")
+        cur.execute(
+            "ALTER TABLE prep_list_items ADD COLUMN assigned_staff_id INTEGER REFERENCES staff(id)"
+        )
     if "last_update_at" not in prep_cols:
         cur.execute("ALTER TABLE prep_list_items ADD COLUMN last_update_at TEXT")
     if "last_update_by" not in prep_cols:
         cur.execute("ALTER TABLE prep_list_items ADD COLUMN last_update_by TEXT")
     if "hold_reason" not in prep_cols:
         cur.execute("ALTER TABLE prep_list_items ADD COLUMN hold_reason TEXT")
-    cur.execute(
-        """
+    cur.execute("""
         UPDATE prep_list_items
         SET target_quantity = COALESCE(target_quantity, need_quantity),
             completed_quantity = COALESCE(completed_quantity, 0),
             display_unit = COALESCE(display_unit, unit),
             last_update_at = COALESCE(last_update_at, created_at)
-        """
+        """)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prep_list_items_status_station ON prep_list_items(status, station_id)"
     )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_prep_list_items_status_station ON prep_list_items(status, station_id)")
 
     # Staff chat-role mapping migration.
     cur.execute("PRAGMA table_info(staff)")
@@ -750,13 +805,11 @@ def init_db() -> None:
     if ingest_cols and "created_at" not in ingest_cols:
         cur.execute("ALTER TABLE ingest_jobs ADD COLUMN created_at TEXT")
     if ingest_cols:
-        cur.execute(
-            """
+        cur.execute("""
             UPDATE ingest_jobs
             SET created_at = COALESCE(created_at, started_at, updated_at, CURRENT_TIMESTAMP)
             WHERE created_at IS NULL
-            """
-        )
+            """)
 
     # doc_sources migration: add updated_at and queued status support.
     cur.execute("PRAGMA table_info(doc_sources)")
@@ -764,13 +817,11 @@ def init_db() -> None:
     if doc_source_cols and "updated_at" not in doc_source_cols:
         cur.execute("ALTER TABLE doc_sources ADD COLUMN updated_at TEXT")
     if doc_source_cols:
-        cur.execute(
-            """
+        cur.execute("""
             UPDATE doc_sources
             SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
             WHERE updated_at IS NULL
-            """
-        )
+            """)
 
     # SQLite does not support altering CHECK constraints; rebuild table if queued is unsupported.
     ds_sql_row = cur.execute(
@@ -796,8 +847,7 @@ def init_db() -> None:
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         """)
-        cur.execute(
-            """
+        cur.execute("""
             INSERT INTO doc_sources (
                 id, ingest_id, filename, source_type, restaurant_tag, file_sha256, file_size,
                 extracted_text_chars, chunk_count, chunks_added, status, created_at, updated_at
@@ -812,11 +862,12 @@ def init_db() -> None:
                 created_at,
                 COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
             FROM doc_sources_legacy
-            """
-        )
+            """)
         cur.execute("DROP TABLE doc_sources_legacy")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_doc_sources_created ON doc_sources(created_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_doc_sources_file_sha ON doc_sources(file_sha256)")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doc_sources_file_sha ON doc_sources(file_sha256)"
+        )
 
     # Ensure autonomy_status row exists after upgrades.
     cur.execute("INSERT OR IGNORE INTO autonomy_status (id, is_running) VALUES (1, 0)")
@@ -833,9 +884,12 @@ def init_db() -> None:
         for row in legacy_rows:
             supplier = (row["supplier"] or "").strip() or "Legacy Receiving Entry"
             issue_text = "Issue flagged." if row["has_issue"] else ""
-            note_text = " ".join(
-                part for part in [(row["notes"] or "").strip(), issue_text] if part
-            ).strip() or None
+            note_text = (
+                " ".join(
+                    part for part in [(row["notes"] or "").strip(), issue_text] if part
+                ).strip()
+                or None
+            )
             cur.execute(
                 """
                 INSERT INTO receiving_log (
@@ -863,6 +917,7 @@ def init_db() -> None:
     con.commit()
     con.close()
 
+
 def get_or_create_user(telegram_user_id: int, display_name: str) -> None:
     con = _conn()
     con.execute(
@@ -871,6 +926,7 @@ def get_or_create_user(telegram_user_id: int, display_name: str) -> None:
     )
     con.commit()
     con.close()
+
 
 def get_or_create_active_session(chat_id: int, user_id: int) -> int:
     con = _conn()
@@ -894,6 +950,7 @@ def get_or_create_active_session(chat_id: int, user_id: int) -> int:
     con.close()
     return session_id
 
+
 def add_message(session_id: int, role: str, content: str) -> None:
     con = _conn()
     con.execute(
@@ -902,6 +959,7 @@ def add_message(session_id: int, role: str, content: str) -> None:
     )
     con.commit()
     con.close()
+
 
 def get_recent_messages(session_id: int, limit: int = 16) -> List[Tuple[str, str]]:
     con = _conn()

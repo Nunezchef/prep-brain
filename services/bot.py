@@ -11,7 +11,15 @@ from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, Defaults, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    Defaults,
+    MessageHandler,
+    filters,
+)
 from telegram.request import HTTPXRequest
 
 import services.commands as commands
@@ -20,7 +28,13 @@ import services.kitchen_ops as ops
 import services.ops_router as ops_router
 import services.ordering as ordering
 import services.prep_list as prep_list
-from services.commands_registry import bind_default_handler, get_root_spec, known_roots, resolve_root, validate_registry
+from services.commands_registry import (
+    bind_default_handler,
+    get_root_spec,
+    known_roots,
+    resolve_root,
+    validate_registry,
+)
 from services import autonomy as autonomy_service
 from services import memory as memory_service
 from services.brain import chat
@@ -34,14 +48,19 @@ from services.memory import (
 )
 from services.tg_format import tg_escape
 from services.transcriber import transcribe_file
-from prep_brain.config import load_config
+from prep_brain.config import load_config, resolve_path
+
+try:
+    import fcntl  # type: ignore
+except Exception:  # pragma: no cover - non-posix fallback
+    fcntl = None  # type: ignore
 
 
 CONFIG = load_config()
 
-WORKDIR = Path("./data/tmp")
+WORKDIR = resolve_path("data/tmp")
 WORKDIR.mkdir(parents=True, exist_ok=True)
-INVOICE_DIR = Path("./data/invoices")
+INVOICE_DIR = resolve_path("data/invoices")
 INVOICE_DIR.mkdir(parents=True, exist_ok=True)
 
 TELEGRAM_MESSAGE_LIMIT = 3500
@@ -69,10 +88,56 @@ logger = logging.getLogger(__name__)
 COMMAND_RUNNER = CommandRunner()
 AUTONOMY_WORKER = None
 AUTONOMY_TASK: Optional[asyncio.Task] = None
+BOT_LOCK_PATH = resolve_path("run/bot.singleton.lock")
+BOT_LOCK_HANDLE = None
+
+
+def _acquire_bot_singleton() -> bool:
+    global BOT_LOCK_HANDLE
+    if BOT_LOCK_HANDLE is not None:
+        return True
+    if fcntl is None:
+        BOT_LOCK_HANDLE = open(BOT_LOCK_PATH, "a+")
+        return True
+    try:
+        BOT_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        BOT_LOCK_HANDLE = open(BOT_LOCK_PATH, "a+")
+        fcntl.flock(BOT_LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        BOT_LOCK_HANDLE.seek(0)
+        BOT_LOCK_HANDLE.truncate(0)
+        BOT_LOCK_HANDLE.write(str(os.getpid()))
+        BOT_LOCK_HANDLE.flush()
+        return True
+    except Exception:
+        try:
+            if BOT_LOCK_HANDLE is not None:
+                BOT_LOCK_HANDLE.close()
+        except Exception:
+            pass
+        BOT_LOCK_HANDLE = None
+        return False
+
+
+def _release_bot_singleton() -> None:
+    global BOT_LOCK_HANDLE
+    if BOT_LOCK_HANDLE is None:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(BOT_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        BOT_LOCK_HANDLE.close()
+    except Exception:
+        pass
+    BOT_LOCK_HANDLE = None
 
 
 def _invoice_cfg() -> Dict[str, object]:
-    return CONFIG.get("invoice_ingest", {}) if isinstance(CONFIG.get("invoice_ingest"), dict) else {}
+    return (
+        CONFIG.get("invoice_ingest", {}) if isinstance(CONFIG.get("invoice_ingest"), dict) else {}
+    )
 
 
 def _ordering_cfg() -> Dict[str, object]:
@@ -88,7 +153,9 @@ def _invoice_vendor_threshold() -> float:
 
 
 def _job_source_type(source_type: str, knowledge_tier: str) -> str:
-    return autonomy_service.normalize_job_source_type(source_type=source_type, knowledge_tier=knowledge_tier)
+    return autonomy_service.normalize_job_source_type(
+        source_type=source_type, knowledge_tier=knowledge_tier
+    )
 
 
 def _fmt_bytes(num_bytes: int) -> str:
@@ -143,7 +210,9 @@ def is_admin(update: Update) -> bool:
     return any(token in role for token in ("chef", "sous", "cdc", "head", "admin"))
 
 
-async def _typing_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int, stop_event: asyncio.Event) -> None:
+async def _typing_loop(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, stop_event: asyncio.Event
+) -> None:
     while not stop_event.is_set():
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         await asyncio.sleep(4)
@@ -286,7 +355,9 @@ def _normalize_component_title(raw_text: str, user_query: Optional[str]) -> str:
     if cleaned_query:
         return _truncate(cleaned_query.title(), 80)
 
-    candidate_lines = [line.strip() for line in _strip_markdown(raw_text).split("\n") if line.strip()]
+    candidate_lines = [
+        line.strip() for line in _strip_markdown(raw_text).split("\n") if line.strip()
+    ]
     for line in candidate_lines:
         if len(line.split()) <= 8:
             return _truncate(line.title(), 80)
@@ -300,8 +371,12 @@ def _format_component_recipe_html(raw_text: str, user_query: Optional[str] = Non
     cleaned = _strip_markdown(raw_text)
     lines = [line.strip() for line in cleaned.split("\n") if line.strip()]
     bullet_pattern = re.compile(r"^(?:[-•*]|\d+[\.)])\s+(.+)$")
-    section_header_pattern = re.compile(r"^(?:base recipe|ingredients?|key points|method|in the kitchen)\b", re.I)
-    quantity_hint_pattern = re.compile(r"(\d|ml|l\b|g\b|kg\b|oz\b|lb\b|tbsp|tsp|cup|%|xgum|xanthan)", re.I)
+    section_header_pattern = re.compile(
+        r"^(?:base recipe|ingredients?|key points|method|in the kitchen)\b", re.I
+    )
+    quantity_hint_pattern = re.compile(
+        r"(\d|ml|l\b|g\b|kg\b|oz\b|lb\b|tbsp|tsp|cup|%|xgum|xanthan)", re.I
+    )
 
     ingredient_lines: List[str] = []
     in_base_section = False
@@ -312,7 +387,11 @@ def _format_component_recipe_html(raw_text: str, user_query: Optional[str] = Non
         normalized = re.sub(r"<[^>]+>", "", line).strip()
         lowered = normalized.lower().strip(":")
 
-        if lowered.startswith("base recipe") or lowered.startswith("ingredients") or lowered.startswith("key points"):
+        if (
+            lowered.startswith("base recipe")
+            or lowered.startswith("ingredients")
+            or lowered.startswith("key points")
+        ):
             in_base_section = True
             in_method_section = False
             continue
@@ -544,7 +623,9 @@ async def _send_html_reply(update: Update, formatted_text: str) -> None:
                 disable_web_page_preview=True,
             )
         except Exception as exc:
-            logger.warning("Failed to send formatted HTML reply, falling back to escaped text: %s", exc)
+            logger.warning(
+                "Failed to send formatted HTML reply, falling back to escaped text: %s", exc
+            )
             safe_chunk = html.escape(_to_plain_text(chunk))
             await update.message.reply_text(
                 safe_chunk,
@@ -676,7 +757,13 @@ async def _prompt_ops_recipe_choice(
     for choice in choices[:5]:
         recipe_id = int(choice.get("id"))
         recipe_name = str(choice.get("name") or f"Recipe {recipe_id}")
-        buttons.append([InlineKeyboardButton(f"{recipe_name} (id {recipe_id})", callback_data=f"opsrec:{recipe_id}")])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{recipe_name} (id {recipe_id})", callback_data=f"opsrec:{recipe_id}"
+                )
+            ]
+        )
     buttons.append([InlineKeyboardButton("Cancel", callback_data="opscancel:0")])
 
     context.user_data[PENDING_OPS_INTENT_KEY] = intent
@@ -727,11 +814,17 @@ async def _execute_sales_price_update(
         )
         return True
     if status == "not_found":
-        target = str(result.get("target_name") or intent.get("target_name") or "").strip() or "query"
-        await update.message.reply_text(f"⚠️ No match for '{tg_escape(target)}'. Try /recipe find \"ribs\"")
+        target = (
+            str(result.get("target_name") or intent.get("target_name") or "").strip() or "query"
+        )
+        await update.message.reply_text(
+            f"⚠️ No match for '{tg_escape(target)}'. Try /recipe find \"ribs\""
+        )
         return True
     if status == "validation_error":
-        await update.message.reply_text(f"⚠️ {tg_escape(str(result.get('message') or 'Invalid value.'))}")
+        await update.message.reply_text(
+            f"⚠️ {tg_escape(str(result.get('message') or 'Invalid value.'))}"
+        )
         return True
     if status == "needs_confirmation":
         context.user_data[PENDING_OPS_CONFIRM_KEY] = {
@@ -859,7 +952,9 @@ async def handle_invoice_photo(update: Update, context: ContextTypes.DEFAULT_TYP
     for candidate in candidates[:5]:
         vendor_id = int(candidate.get("vendor_id"))
         vendor_name = str(candidate.get("vendor_name") or f"Vendor {vendor_id}")
-        buttons.append([InlineKeyboardButton(vendor_name, callback_data=f"invsel:{ingest_id}:{vendor_id}")])
+        buttons.append(
+            [InlineKeyboardButton(vendor_name, callback_data=f"invsel:{ingest_id}:{vendor_id}")]
+        )
     buttons.append([InlineKeyboardButton("New Vendor", callback_data=f"invnew:{ingest_id}:0")])
     await update.message.reply_text(
         "Which vendor is this?",
@@ -909,7 +1004,12 @@ async def handle_inline_callbacks(update: Update, context: ContextTypes.DEFAULT_
 
     if action == "ordsel":
         pending = context.user_data.get(PENDING_ORDER_CONTEXT_KEY)
-        if not pending or not query.message or not update.effective_chat or not update.effective_user:
+        if (
+            not pending
+            or not query.message
+            or not update.effective_chat
+            or not update.effective_user
+        ):
             return
         try:
             vendor_id = int(part1)
@@ -955,7 +1055,9 @@ async def handle_inline_callbacks(update: Update, context: ContextTypes.DEFAULT_
             price=float(pending.get("price") or 0.0),
             unit=str(pending.get("unit") or "portion"),
             actor_telegram_user_id=int(update.effective_user.id),
-            actor_display_name=(update.effective_user.full_name or update.effective_user.first_name or "Chef").strip(),
+            actor_display_name=(
+                update.effective_user.full_name or update.effective_user.first_name or "Chef"
+            ).strip(),
             raw_note=str(pending.get("raw_text") or ""),
         )
         if str(result.get("status")) == "updated":
@@ -977,7 +1079,9 @@ async def cutoff_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not reminders:
             return
 
-        default_targets = [int(value) for value in CONFIG.get("telegram", {}).get("allowed_user_ids", []) if value]
+        default_targets = [
+            int(value) for value in CONFIG.get("telegram", {}).get("allowed_user_ids", []) if value
+        ]
         for reminder in reminders:
             vendor_id = int(reminder["vendor_id"])
             chat_ids = ordering.pending_chat_ids_for_vendor(vendor_id) or default_targets
@@ -1055,9 +1159,37 @@ def _request_requires_admin(req: commands.CommandRequest) -> bool:
     first = str(req.args[0]).lower() if req.args else ""
     second = str(req.args[1]).lower() if len(req.args) > 1 else ""
 
-    if root in {"mode", "silence", "unsilence", "log", "pause", "debug", "jobs", "job", "source", "ingest", "reingest", "forget", "price", "cost", "par"}:
+    if root in {
+        "mode",
+        "silence",
+        "unsilence",
+        "log",
+        "pause",
+        "debug",
+        "jobs",
+        "job",
+        "source",
+        "ingest",
+        "reingest",
+        "forget",
+        "price",
+        "cost",
+        "par",
+    }:
         return True
-    if root in {"approve", "hold", "reject", "setname", "setyield", "setstation", "setmethod", "seting", "adding", "deling", "noteing"}:
+    if root in {
+        "approve",
+        "hold",
+        "reject",
+        "setname",
+        "setyield",
+        "setstation",
+        "setmethod",
+        "seting",
+        "adding",
+        "deling",
+        "noteing",
+    }:
         return True
     if root == "recipe" and first in {"activate", "deactivate"}:
         return True
@@ -1067,7 +1199,9 @@ def _request_requires_admin(req: commands.CommandRequest) -> bool:
         return True
     if root == "order" and first == "clear":
         return True
-    if root == "prep" and (first in {"add", "assign", "hold", "done"} or (first == "clear" and second == "done")):
+    if root == "prep" and (
+        first in {"add", "assign", "hold", "done"} or (first == "clear" and second == "done")
+    ):
         return True
     spec = get_root_spec(root)
     return bool(spec.admin_only) if spec else False
@@ -1081,7 +1215,8 @@ async def handle_command_message(update: Update, context: ContextTypes.DEFAULT_T
 
     command_text = update.message.text.strip().lower()
     if command_text in {"/yes", "/no"} and (
-        context.user_data.get(PENDING_OPS_COST_KEY) or context.user_data.get(PENDING_OPS_CONFIRM_KEY)
+        context.user_data.get(PENDING_OPS_COST_KEY)
+        or context.user_data.get(PENDING_OPS_CONFIRM_KEY)
     ):
         handled = await _process_pending_ops_followup(update, context, command_text)
         if handled:
@@ -1111,7 +1246,13 @@ async def handle_command_message(update: Update, context: ContextTypes.DEFAULT_T
     stop_event = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(context, chat_id, stop_event))
     try:
-        response = commands.execute_command(req, context.chat_data, telegram_chat_id=chat_id, telegram_user_id=telegram_user_id, display_name=display_name or "Chef")
+        response = commands.execute_command(
+            req,
+            context.chat_data,
+            telegram_chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            display_name=display_name or "Chef",
+        )
     except Exception as exc:
         logger.exception("Command dispatch failed: %s", exc)
         response = commands.CommandResponse(text="Command failed.")
@@ -1147,7 +1288,9 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text("Unknown command. /help")
 
 
-async def _registry_dispatch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]) -> None:
+async def _registry_dispatch_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
+) -> None:
     _ = args
     await handle_command_message(update, context)
 
@@ -1477,7 +1620,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    docs_dir = Path("./data/documents")
+    docs_dir = resolve_path("data/documents")
     docs_dir.mkdir(parents=True, exist_ok=True)
     local_path = docs_dir / file_name
 
@@ -1552,9 +1695,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # --- KITCHEN OPS HANDLERS ---
 
+
 async def help_chef_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed(update): return
-    
+    if not _allowed(update):
+        return
+
     help_text = [
         "/inventory [item] - Check stock",
         "/count <item> <qty> [unit] - Update stock",
@@ -1573,7 +1718,7 @@ async def help_chef_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "/86 <item> - Mark out of stock",
         "/cost <item> - Check item cost",
     ]
-    
+
     await _send_html_reply(
         update,
         _build_kitchen_card_html(
@@ -1581,59 +1726,70 @@ async def help_chef_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             summary="Available kitchen operation tools.",
             key_points=help_text,
             kitchen_lines=["Use these commands to manage the kitchen."],
-            max_key_points=12
-        )
+            max_key_points=12,
+        ),
     )
 
+
 async def inventory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed(update): return
+    if not _allowed(update):
+        return
     args = context.args
     item_name = " ".join(args).strip() if args else None
-    
+
     items = ops.get_inventory_status(item_name)
     if not items:
-        msg = f"No inventory records found for '{item_name}'." if item_name else "Inventory is empty."
-        await _send_html_reply(update, _build_kitchen_card_html("Inventory", msg, [], ["Use /count to add items."]))
+        msg = (
+            f"No inventory records found for '{item_name}'." if item_name else "Inventory is empty."
+        )
+        await _send_html_reply(
+            update, _build_kitchen_card_html("Inventory", msg, [], ["Use /count to add items."])
+        )
         return
 
     report = []
     for i in items:
         report.append(f"{i['name']}: {i['quantity']} {i['unit']}")
-    
+
     # If too many, just show top 10 and count
     summary = f"Found {len(items)} items."
     if len(report) > 10:
         summary += f" Showing top 10."
-    
-    await _send_html_reply(update, _build_kitchen_card_html(
-        "Inventory Status",
-        summary,
-        report[:10], 
-        ["Use /count <item> <qty> to update stock."]
-    ))
+
+    await _send_html_reply(
+        update,
+        _build_kitchen_card_html(
+            "Inventory Status", summary, report[:10], ["Use /count <item> <qty> to update stock."]
+        ),
+    )
+
 
 async def count_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed(update): return
+    if not _allowed(update):
+        return
     args = context.args
     if not args or len(args) < 2:
-        await _send_html_reply(update, _build_kitchen_card_html("Usage Error", "Usage: /count <item> <qty> [unit]", [], []))
+        await _send_html_reply(
+            update,
+            _build_kitchen_card_html("Usage Error", "Usage: /count <item> <qty> [unit]", [], []),
+        )
         return
-    
+
     # Try parsing: "onions 5 kg" -> name="onions", qty=5, unit="kg"
     # Or "5 kg onions" -> difficult
     # Strategy: Look for the number.
-    
+
     qty = None
     unit = "unit"
     name_parts = []
-    
+
     for i, arg in enumerate(args):
         try:
             val = float(arg)
             qty = val
             # If next arg exists and is not a number, it's unit?
             if i + 1 < len(args):
-                possible_unit = args[i+1]
+                possible_unit = args[i + 1]
                 # If it's a known unit or short string
                 if len(possible_unit) < 5 and not any(c.isdigit() for c in possible_unit):
                     unit = possible_unit
@@ -1641,7 +1797,7 @@ async def count_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     # This logic is brittle. Let's stick to strict suffix: <name> <qty> [unit]
         except ValueError:
             pass
-            
+
     # Fallback to suffix parsing if complex parsing fails or isn't implemented
     try:
         qty = float(args[-1])
@@ -1652,82 +1808,104 @@ async def count_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             unit = args[-1]
             name = " ".join(args[:-2])
         except (ValueError, IndexError):
-             await _send_html_reply(update, _build_kitchen_card_html("Usage Error", "Could not parse quantity. Try: /count onions 5 kg", [], []))
-             return
-             
+            await _send_html_reply(
+                update,
+                _build_kitchen_card_html(
+                    "Usage Error", "Could not parse quantity. Try: /count onions 5 kg", [], []
+                ),
+            )
+            return
+
     result = ops.update_inventory(name, qty, unit)
     await _send_html_reply(update, _build_kitchen_card_html("Inventory Updated", result, [], []))
 
+
 async def waste_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed(update): return
+    if not _allowed(update):
+        return
     args = context.args
     if len(args) < 3:
-         await _send_html_reply(update, _build_kitchen_card_html("Usage Error", "Usage: /waste <item> <qty> <reason>", [], []))
-         return
-         
+        await _send_html_reply(
+            update,
+            _build_kitchen_card_html("Usage Error", "Usage: /waste <item> <qty> <reason>", [], []),
+        )
+        return
+
     # /waste onions 2 kg dropped -> complicated to parse
     # Let's assume: /waste <item> <qty> <reason> where reason is the last word(s)
     # Actually, let's just parse the number and assume everything before is name, everything after is reason?
     # Or simple: item first_arg, qty second_arg, reason rest.
     # But names have spaces.
-    
+
     # Simpler: assume last arg is reason, 2nd to last is unit, 3rd to last is qty?
     # No, reason can be multi-word.
-    
+
     # Strict format: /waste <qty> <unit> <item> REASON: <reason> ??? No.
     # Let's try: parse regex for number.
-    
+
     text = " ".join(args)
     # Find the first number token
     match = re.search(r"(\d+(?:\.\d+)?)", text)
     if not match:
-        await _send_html_reply(update, _build_kitchen_card_html("Error", "No quantity found.", [], []))
+        await _send_html_reply(
+            update, _build_kitchen_card_html("Error", "No quantity found.", [], [])
+        )
         return
-        
+
     qty_val = float(match.group(1))
     # split by that number
     parts = text.split(match.group(1), 1)
     name = parts[0].strip()
     remainder = parts[1].strip()
-    
+
     # Remainder might be "kg dropped on floor"
     remainder_parts = remainder.split(" ", 1)
     if not remainder_parts:
-         await _send_html_reply(update, _build_kitchen_card_html("Error", "Please provide a reason.", [], []))
-         return
-         
+        await _send_html_reply(
+            update, _build_kitchen_card_html("Error", "Please provide a reason.", [], [])
+        )
+        return
+
     # Heuristic: if first word of remainder is short, it's unit
     unit = "unit"
     reason = remainder
-    if len(remainder_parts[0]) <= 3: # kg, lbs, oz
+    if len(remainder_parts[0]) <= 3:  # kg, lbs, oz
         unit = remainder_parts[0]
         reason = remainder_parts[1] if len(remainder_parts) > 1 else "waste"
-        
+
     user = update.effective_user.first_name
     result = ops.log_waste(name, qty_val, reason, user)
     await _send_html_reply(update, _build_kitchen_card_html("Waste Logged", result, [], []))
 
+
 async def unavailable_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed(update): return
+    if not _allowed(update):
+        return
     args = context.args
     if not args:
         return
     name = " ".join(args)
     result = ops.set_item_unavailable(name)
-    await _send_html_reply(update, _build_kitchen_card_html("86'd Item", result, [], ["Front of house notified (mock)."]))
+    await _send_html_reply(
+        update,
+        _build_kitchen_card_html("86'd Item", result, [], ["Front of house notified (mock)."]),
+    )
+
 
 async def prep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed(update): return
+    if not _allowed(update):
+        return
     args = context.args
-    
+
     if args and args[0].lower() == "add":
         # /prep add <task>
         task = " ".join(args[1:])
-        if not task: return
+        if not task:
+            return
         res = ops.add_prep_task(task, update.effective_user.first_name)
         await _send_html_reply(update, _build_kitchen_card_html("Prep Added", res, [], []))
         return
-        
+
     if args and args[0].lower() == "done":
         # /prep done <id>
         try:
@@ -1744,21 +1922,30 @@ async def prep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     # List
-    tasks = ops.get_prep_list('todo')
+    tasks = ops.get_prep_list("todo")
     if not tasks:
-        await _send_html_reply(update, _build_kitchen_card_html("Prep List", "No pending prep tasks.", [], ["/prep add <task> to create one."]))
+        await _send_html_reply(
+            update,
+            _build_kitchen_card_html(
+                "Prep List", "No pending prep tasks.", [], ["/prep add <task> to create one."]
+            ),
+        )
         return
 
     points = []
     for t in tasks:
         points.append(f"[{t['id']}] {t['task']} ({t['assigned_to'] or 'unassigned'})")
-        
-    await _send_html_reply(update, _build_kitchen_card_html(
-        "Prep List", 
-        f"{len(tasks)} tasks pending.",
-        points,
-        ["Use /prep done <id> to complete.", "/prep add <task> to add."]
-    ))
+
+    await _send_html_reply(
+        update,
+        _build_kitchen_card_html(
+            "Prep List",
+            f"{len(tasks)} tasks pending.",
+            points,
+            ["Use /prep done <id> to complete.", "/prep add <task> to add."],
+        ),
+    )
+
 
 async def order_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
@@ -1771,6 +1958,7 @@ async def order_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     handled = await _process_order_text(update, context, text=f"order {' '.join(args)}")
     if not handled:
         await update.message.reply_text("Could not parse order. Example: /order 50# white onions")
+
 
 async def guide_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
@@ -1795,61 +1983,69 @@ async def guide_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ),
     )
 
+
 async def cost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed(update): return
+    if not _allowed(update):
+        return
     args = context.args
-    if not args: return
+    if not args:
+        return
     name = " ".join(args)
     res = ops.get_item_cost(name)
     await _send_html_reply(update, _build_kitchen_card_html("Cost Check", res, [], []))
 
+
 async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed(update): return
+    if not _allowed(update):
+        return
     args = context.args
     if not args:
         await _send_html_reply(update, _build_kitchen_card_html("Usage", "/recipe <name>", [], []))
         return
-        
+
     # Trigger normal chat but with prefix to ensure it hits recipe logic
-    query = "Recipe for: " + " ".join(args) 
-    
+    query = "Recipe for: " + " ".join(args)
+
     # Manually invoke brain chat
     # reusing handle_text logic partially? No, just call chat directly.
     # But we need session handling?
-    # Let's just create a new update.message.text and call handle_text? 
+    # Let's just create a new update.message.text and call handle_text?
     # Or cleaner: just duplicate the chat call logic briefly or refactor handle_text.
     # To save space, let's just make a synthetic call to handle_text by modifying the update object in place?
     # No, that's hacky.
-    
-    # Refactor: extract chat logic? 
+
+    # Refactor: extract chat logic?
     # Or just call chat() here.
-    
+
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     session_id = get_or_create_active_session(chat_id, user_id)
-    
+
     # Dont add user message to history, just the virtual query?
     # Or just treat it as a user message.
     add_message(session_id, "user", query)
-    
+
     # Notify user we are searching
     status_msg = await update.message.reply_text("Searching for recipe...")
-    
+
     try:
         history = get_recent_messages(session_id, limit=16)
         answer = chat(history)
         fmt = _format_assistant_card(answer, user_query=query)
         add_message(session_id, "assistant", _to_plain_text(fmt))
-        
+
         await context.bot.delete_message(chat_id, status_msg.message_id)
         await _send_html_reply(update, fmt)
     except Exception as exc:
         await _send_html_reply(update, _build_kitchen_card_html("Error", str(exc), [], []))
 
+
 async def invoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         return
-    await update.message.reply_text("Send invoice photo. I ingest silently unless vendor confirmation is needed.")
+    await update.message.reply_text(
+        "Send invoice photo. I ingest silently unless vendor confirmation is needed."
+    )
 
 
 async def email_vendor_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1862,7 +2058,9 @@ async def email_vendor_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     draft = ordering.build_vendor_email_draft(vendor_id)
     if not draft.get("ok"):
-        await update.message.reply_text(f"Action required: {draft.get('error', 'could not build draft')}")
+        await update.message.reply_text(
+            f"Action required: {draft.get('error', 'could not build draft')}"
+        )
         return
     await update.message.reply_text(
         f"Draft ready for {draft['vendor_name']} ({draft['items_count']} items). "
@@ -1880,7 +2078,9 @@ async def review_vendor_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     draft = ordering.build_vendor_email_draft(vendor_id)
     if not draft.get("ok"):
-        await update.message.reply_text(f"Action required: {draft.get('error', 'could not build draft')}")
+        await update.message.reply_text(
+            f"Action required: {draft.get('error', 'could not build draft')}"
+        )
         return
 
     preview = (
@@ -1951,19 +2151,20 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("Usage: /forget vendor <id> OR /forget invoices")
 
 
-
-
-
 def run_bot() -> None:
     global AUTONOMY_WORKER
     env_path = Path(".") / ".env"
     load_dotenv(dotenv_path=env_path)
     init_db()
+    if not _acquire_bot_singleton():
+        raise RuntimeError("Another Prep-Brain bot instance is already running.")
     bind_default_handler(_registry_dispatch_handler)
     registry_issues = validate_registry()
     if registry_issues:
         for issue in registry_issues:
             logger.error("Command registry issue: %s", issue)
+    commands.validate_command_registry_handlers()
+    logger.info("Prep-Brain bot DB path: %s", str(memory_service.get_db_path()))
 
     env_var_name = CONFIG["telegram"].get("bot_token_env_var", "TELEGRAM_BOT_TOKEN")
     token = os.getenv(env_var_name, "").strip()
@@ -2000,9 +2201,14 @@ def run_bot() -> None:
     if app.job_queue is not None:
         app.job_queue.run_repeating(cutoff_reminder_job, interval=300, first=20)
     else:
-        logger.warning("Job queue unavailable; cutoff reminders disabled. Autonomy still runs in background task.")
+        logger.warning(
+            "Job queue unavailable; cutoff reminders disabled. Autonomy still runs in background task."
+        )
 
-    app.run_polling(close_loop=False)
+    try:
+        app.run_polling(close_loop=False)
+    finally:
+        _release_bot_singleton()
 
 
 if __name__ == "__main__":
