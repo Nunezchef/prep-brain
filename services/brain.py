@@ -1,96 +1,14 @@
+import html
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
+
 from prep_brain.config import load_config
 
 logger = logging.getLogger(__name__)
-
-CHEF_CARD_STYLE_APPENDIX = """Assistant Response Style
-
-You are a kitchen and restaurant operations assistant.
-
-You must format all answers for Telegram delivery using HTML and a concise "chef reference card" style:
-- Start with a bold title.
-- Follow with a single clear definition or answer.
-- Use a short bullet list for key points (3-5 bullets max).
-- Include a brief "In the kitchen" section focused on real-world application.
-- Keep answers practical, grounded, and calm.
-
-Avoid:
-- Long paragraphs
-- Academic or textbook language
-- Overly verbose explanations
-- Generic chatbot phrasing
-
-Speak like a senior chef explaining something during prep or service: precise, minimal, and useful.
-"""
-
-GROUNDING_RULE_APPENDIX = """Grounding Rule (MANDATORY)
-
-When reference context from the local knowledge base is provided:
-- Base your answer primarily on that context.
-- Prefer specific claims, mechanisms, or observations stated in the source.
-- Avoid generic textbook explanations when a cited source is available.
-- If the source does not explicitly answer the question, say so clearly.
-- Do not use filler phrases without completing the idea.
-
-Attribution Rule:
-- When mentioning an author or book, only attribute claims that are supported by retrieved context.
-"""
-
-ANTI_REPETITION_RULE_APPENDIX = """Anti-Repetition Rule (MANDATORY)
-
-- Do not restate the same sentence or idea in multiple sections of the same answer.
-- Each section must add new information.
-"""
-
-SOURCE_GROUNDED_AUTHOR_RULE_APPENDIX = """Source-Grounded Answering Rule (MANDATORY)
-
-When reference context from the local knowledge base (RAG) is provided and the user asks about a specific author, book, or document:
-- Base your answer primarily and explicitly on the retrieved reference context.
-- Prefer specific mechanisms, distinctions, or constraints stated in the source.
-- Do not substitute generic background knowledge under an author's name.
-- Avoid vague filler phrases.
-- If the retrieved context does not clearly support a claim, say exactly:
-  "The retrieved material does not explicitly address this."
-- Do not repeat introductory sentences or restate the same idea in multiple sections.
-
-Your role is to interpret and explain the source, not to summarize general knowledge.
-
-RAG Context Handling:
-- Treat retrieved RAG context as authoritative evidence.
-- When a source is cited (for example, an author or book), only attribute claims supported by retrieved context.
-- If multiple chunks are retrieved, synthesize them carefully rather than generalizing.
-"""
-
-RECIPE_AUTHORITY_RULE_APPENDIX = """Recipe Authority Rule
-
-When answering questions about a specific dish or recipe:
-- Use restaurant recipe sources as the sole authority when available.
-- Do not supplement or replace missing recipe information with reference material.
-- If a recipe does not specify something, say so explicitly.
-- Reference sources may only be used to explain why a step exists, never what the recipe is.
-"""
-
-COMPONENT_FIRST_RULE_APPENDIX = """Component-First Answering Rule (MANDATORY)
-
-When the user asks for a recipe component (for example: vinaigrette, glaze, custard, sauce):
-1) Respond with the base recipe first (ingredients and quantities).
-2) Do not include plating ratios or dish assembly unless explicitly asked.
-3) If relevant, include a single-line "In service" note.
-4) Do not suggest quantity adjustments.
-5) Do not ask follow-up questions.
-6) Avoid filler, hedging, and conversational padding.
-
-Style (Kitchen Mode):
-- Be concise.
-- Be directive.
-- Avoid duplicated phrases.
-- Sound like a senior sous chef reading from the prep book.
-"""
 
 RECIPE_QUERY_PATTERNS = [
     r"\brecipe\b",
@@ -146,6 +64,54 @@ COMPONENT_ASSEMBLY_EXCLUSION_TERMS = [
     "prawns",
     "shallot",
 ]
+
+CITATION_QUERY_RE = re.compile(r"\b(cite|citation|quote|quoted|verbatim|source line)\b", re.I)
+CHUNK_REF_RE = re.compile(r"\(C(\d+)\)")
+
+STYLE_APPENDIX_BY_NAME: Dict[str, str] = {
+    "concise": (
+        "Response style (concise):\n"
+        "- Keep answers to 3-6 lines.\n"
+        "- No repeated headers.\n"
+        "- No filler, no marketing language.\n"
+        "- Give direct kitchen-usable output."
+    ),
+    "chef_card": (
+        "Response style (chef_card):\n"
+        "- Keep answers compact and practical.\n"
+        "- Use at most one short header only when it adds clarity.\n"
+        "- Use short bullets for procedures or lists.\n"
+        "- Avoid repeated sections and avoid template phrasing."
+    ),
+    "explain": (
+        "Response style (explain):\n"
+        "- Provide slightly more detail while staying concise.\n"
+        "- Keep structure simple and avoid repetitive sections.\n"
+        "- Focus on operational implications."
+    ),
+}
+
+GROUNDING_APPENDIX = (
+    "Grounding and citation rules:\n"
+    "- Use only the provided CONTEXT blocks as evidence when present.\n"
+    "- Cite context using chunk IDs like (C1).\n"
+    "- Never invent citations or source names.\n"
+    "- If context is missing, say exactly: Not in my sources yet.\n"
+    "- For house recipes, never summarize away ingredient lines."
+)
+
+
+def _truncate(text: str, limit: int = 220) -> str:
+    cleaned = " ".join((text or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[:limit]}..."
+
+
+def _query_log_preview(query_text: str, limit: int = 240) -> str:
+    preview = _truncate(query_text or "", limit=limit)
+    length = len(str(query_text or ""))
+    return f"{preview} [len={length}]"
 
 
 def _is_component_query(query_text: str) -> bool:
@@ -207,18 +173,16 @@ def _filter_component_results(
         if _is_component_assembly_chunk(chunk):
             excluded_assembly += 1
             continue
-
         score = _chunk_component_match_score(chunk=chunk, focus_terms=focus_terms)
         if score > 0:
             heading_matched += 1
         scored.append((score, chunk))
 
     scored.sort(key=lambda item: item[0], reverse=True)
-
     preferred = [chunk for score, chunk in scored if score > 0]
     ordered = preferred if preferred else [chunk for _, chunk in scored]
 
-    debug = {
+    return ordered, {
         "component_query": True,
         "focus_terms": focus_terms,
         "before_count": len(results),
@@ -226,40 +190,6 @@ def _filter_component_results(
         "excluded_assembly": excluded_assembly,
         "heading_matched": heading_matched,
     }
-    return ordered, debug
-
-
-def _truncate(text: str, limit: int = 220) -> str:
-    cleaned = " ".join((text or "").split())
-    if len(cleaned) <= limit:
-        return cleaned
-    return f"{cleaned[:limit]}..."
-
-
-def _query_log_preview(query_text: str, limit: int = 240) -> str:
-    preview = _truncate(query_text or "", limit=limit)
-    length = len(str(query_text or ""))
-    return f"{preview} [len={length}]"
-
-
-def _source_snapshot(rag_engine, limit: int = 5) -> str:
-    sources = rag_engine.get_sources() or []
-    if not sources:
-        return "No sources are currently registered in the local knowledge base."
-
-    sources.sort(key=lambda source: source.get("date_ingested", ""), reverse=True)
-    lines = []
-    for idx, source in enumerate(sources[:limit], start=1):
-        title = source.get("title") or source.get("source_name") or "unknown"
-        status = source.get("status", "unknown")
-        chunks = source.get("chunk_count", 0)
-        date_ingested = source.get("date_ingested", "unknown")
-        summary = _truncate(source.get("summary", ""), limit=160)
-        lines.append(
-            f"{idx}. title={title} | status={status} | chunks={chunks} | date_ingested={date_ingested} | summary={summary}"
-        )
-
-    return "\n".join(lines)
 
 
 def _is_recipe_query(query_text: str) -> bool:
@@ -272,6 +202,27 @@ def _is_recipe_query(query_text: str) -> bool:
             return True
 
     return any(f" {term} " in f" {text} " for term in RECIPE_COMPONENT_TERMS)
+
+
+def _is_citation_request(query_text: str) -> bool:
+    return bool(CITATION_QUERY_RE.search((query_text or "").strip()))
+
+
+def _resolve_response_style(
+    config: Dict[str, Any],
+    *,
+    response_style: Optional[str],
+    mode: Optional[str],
+) -> str:
+    style = (response_style or str(config.get("response_style", "concise"))).strip().lower()
+    mode_value = (mode or "").strip().lower()
+    if mode_value == "service":
+        style = "concise"
+    elif mode_value == "admin" and style == "concise":
+        style = "chef_card"
+    if style not in STYLE_APPENDIX_BY_NAME:
+        style = "concise"
+    return style
 
 
 def _retrieve_rag_results(query_text: str, top_k: int):
@@ -289,16 +240,6 @@ def _retrieve_rag_results(query_text: str, top_k: int):
         tier1_results, component_filter = _filter_component_results(
             query_text=query_text,
             results=tier1_results_raw,
-        )
-        logger.info(
-            "RAG component filter: query=%s component_query=%s before=%s after=%s excluded_assembly=%s heading_matched=%s focus_terms=%s",
-            query_text,
-            component_filter["component_query"],
-            component_filter["before_count"],
-            component_filter["after_count"],
-            component_filter["excluded_assembly"],
-            component_filter["heading_matched"],
-            component_filter["focus_terms"],
         )
 
         if tier1_results:
@@ -358,138 +299,164 @@ def _retrieve_rag_results(query_text: str, top_k: int):
     }
 
 
-def _build_rag_reference_context(query_text: str, config: Dict[str, Any]) -> str:
+def _format_context_entries(results: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for idx, chunk in enumerate(results, start=1):
+        source_name = str(chunk.get("source_title") or chunk.get("source") or "unknown").strip()
+        page = chunk.get("page") or chunk.get("page_number") or chunk.get("page_index")
+        page_label = str(page).strip() if page not in (None, "", 0, "0") else ""
+        raw_text = str(chunk.get("content") or "").strip()
+        compact_text = " ".join(raw_text.split())
+        compact_text = compact_text.replace('"', '\\"')
+        compact_text = _truncate(compact_text, limit=1200)
+        entries.append(
+            {
+                "cid": f"C{idx}",
+                "source": source_name,
+                "page": page_label,
+                "text": compact_text,
+                "raw_text": raw_text,
+                "chunk_id": chunk.get("chunk_id", idx - 1),
+            }
+        )
+    return entries
+
+
+def _build_rag_reference_context(
+    query_text: str, config: Dict[str, Any]
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     top_k = int(config.get("rag", {}).get("top_k", 3))
 
-    from services.rag import rag_engine
-
     logger.info("RAG query string: %s", _query_log_preview(query_text))
-
     results, routing = _retrieve_rag_results(query_text=query_text, top_k=top_k)
-    retrieved_count = len(results)
+    context_entries = _format_context_entries(results)
 
-    top_preview = _truncate(results[0]["content"], limit=220) if results else "NONE"
-
-    logger.info("RAG retrieved chunk count: %s", retrieved_count)
-    logger.info("RAG top chunk preview: %s", top_preview)
     logger.info(
-        "RAG routing: recipe_query=%s component_query=%s mode=%s tier1_hits=%s tier3_hits=%s tier1_raw_hits=%s",
+        "RAG routing: recipe_query=%s component_query=%s mode=%s hits=%s",
         routing["recipe_query"],
         routing["component_query"],
         routing["routing_mode"],
-        routing["tier1_hits"],
-        routing["tier3_hits"],
-        routing["tier1_raw_hits"],
-    )
-    logger.info(
-        "RAG component routing details: focus_terms=%s excluded_assembly=%s heading_matched=%s",
-        routing["component_focus_terms"],
-        routing["component_excluded_assembly"],
-        routing["component_heading_matched"],
+        len(context_entries),
     )
 
-    source_snapshot = _source_snapshot(rag_engine, limit=5)
-
-    context_lines: List[str] = [
-        "REFERENCE CONTEXT (RAG)",
+    lines: List[str] = [
+        "CONTEXT (RAG)",
         f"QUERY: {query_text}",
-        f"RETRIEVED_CHUNK_COUNT: {retrieved_count}",
-        f"TOP_CHUNK_PREVIEW: {top_preview}",
-        f"RECIPE_QUERY_DETECTED: {str(routing['recipe_query']).lower()}",
-        f"COMPONENT_QUERY_DETECTED: {str(routing['component_query']).lower()}",
-        f"RAG_ROUTING_MODE: {routing['routing_mode']}",
-        f"TIER1_RECIPE_HITS: {routing['tier1_hits']}",
-        f"TIER1_RECIPE_RAW_HITS: {routing['tier1_raw_hits']}",
-        f"TIER3_REFERENCE_HITS: {routing['tier3_hits']}",
-        f"COMPONENT_FOCUS_TERMS: {', '.join(routing['component_focus_terms']) if routing['component_focus_terms'] else 'NONE'}",
-        f"COMPONENT_ASSEMBLY_EXCLUDED: {routing['component_excluded_assembly']}",
-        f"COMPONENT_HEADING_MATCHED: {routing['component_heading_matched']}",
+        f"RETRIEVED_CHUNK_COUNT: {len(context_entries)}",
+        "If you use context evidence, cite chunk IDs as (C#).",
+        "Do not cite anything outside these chunks.",
         "",
-        "ACTIVE SOURCE SNAPSHOT (MOST RECENT FIRST):",
-        source_snapshot,
-        "",
-        "INSTRUCTIONS:",
-        "- Use RETRIEVED CHUNKS as the highest-priority grounding context.",
-        "- If RETRIEVED_CHUNK_COUNT is 0, explicitly say no direct RAG chunks matched this query.",
-        "- If user asks about the last ingested document, use ACTIVE SOURCE SNAPSHOT metadata.",
-        "- Prefer specific claims/mechanisms from retrieved chunks over generic explanations.",
-        "- If chunks do not explicitly answer the question, say that clearly.",
-        "- Attribute claims to books/authors only when supported by retrieved chunks.",
-        "- For author/book/document questions, interpret retrieved source context instead of generic prior knowledge.",
-        '- If support is missing, state exactly: "The retrieved material does not explicitly address this."',
-        "- Synthesize across chunks carefully; do not generalize beyond retrieved evidence.",
-        "- Avoid vague filler phrasing and avoid repeating the same idea across sections.",
     ]
-
-    if routing["recipe_query"] and routing["tier1_hits"] > 0:
-        context_lines.extend(
-            [
-                "- For dish/recipe questions, Tier 1 recipe sources are the sole recipe authority.",
-                "- Do not inject or infer recipe steps, quantities, or substitutions from reference material.",
-                "- Output order for component/recipe requests: base recipe first (ingredients + quantities).",
-                "- For component requests, include all listed ingredients from retrieved chunks (do not omit xanthan/Xgum when present).",
-                "- Exclude plating ratios and dish assembly unless user explicitly asks for them.",
-                "- Prefer chunks whose heading or nearby text matches the requested component name.",
-                "- Exclude chunks that read like dish assembly or non-base garnish notes.",
-                '- If relevant, include at most one line labeled "In service".',
-                "- Do not suggest quantity adjustments, do not ask follow-up questions, and do not add filler.",
-                '- Template for component answers:\n  "<TITLE>\nBase recipe\n• ingredients...\nMethod\n• Blend, then shear in xanthan."',
-            ]
-        )
-    elif routing["recipe_query"] and routing["tier1_hits"] == 0:
-        context_lines.extend(
-            [
-                "- Tier 1 recipe sources returned no matching chunks for this query.",
-                '- For missing recipe specifics, say exactly: "The retrieved material does not explicitly address this."',
-                "- Reference chunks may explain principles only; they are not recipe instructions.",
-            ]
-        )
-
-    if results:
-        context_lines.extend(["", "RETRIEVED CHUNKS:"])
-        for idx, chunk in enumerate(results, start=1):
-            source = chunk.get("source", "unknown")
-            heading = chunk.get("heading", "")
-            distance = chunk.get("distance", 0)
-            tier = chunk.get("knowledge_tier", "unknown")
-            content = _truncate(chunk.get("content", ""), limit=1200)
-            context_lines.append(
-                f"[{idx}] source={source} | tier={tier} | heading={heading} | distance={distance}\n{content}"
+    if context_entries:
+        for entry in context_entries:
+            page_part = f", page={entry['page']}" if entry["page"] else ""
+            lines.append(
+                f"[{entry['cid']}] source={entry['source']}{page_part}, "
+                f"chunk_id={entry['chunk_id']}, text=\"{entry['text']}\""
             )
     else:
-        logger.warning(
-            "RAG retrieval returned 0 chunks for query: %s", _query_log_preview(query_text)
-        )
-        context_lines.extend(
-            [
-                "",
-                "RETRIEVED CHUNKS: NONE",
-                "NO_MATCHING_CHUNKS_FOUND_FOR_THIS_QUERY=true",
-            ]
-        )
+        lines.append("NO_CONTEXT=true")
 
-    return "\n".join(context_lines)
+    return "\n".join(lines), context_entries, routing
 
 
-def chat(messages: List[Tuple[str, str]]) -> str:
+def _normalize_quote_candidates(raw_text: str) -> List[str]:
+    compact = " ".join((raw_text or "").split()).strip()
+    if not compact:
+        return []
+
+    candidates: List[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", compact):
+        value = sentence.strip(" \"'")
+        if not value:
+            continue
+        words = value.split()
+        if 4 <= len(words) <= 25:
+            candidates.append(value)
+
+    if not candidates:
+        snippet = " ".join(compact.split()[:25]).strip()
+        if snippet:
+            candidates.append(snippet)
+
+    unique: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _citation_refusal_response() -> str:
+    return (
+        "No relevant passage found in current sources for that request.\n"
+        "Not in my sources yet.\n"
+        "Try broadening the query or reingest/OCR the source."
+    )
+
+
+def _build_grounded_quote_response(query_text: str, context_entries: Sequence[Dict[str, Any]]) -> str:
+    _ = query_text
+    if not context_entries:
+        return _citation_refusal_response()
+
+    lines: List[str] = []
+    quote_count = 0
+    for entry in context_entries:
+        if quote_count >= 2:
+            break
+        candidates = _normalize_quote_candidates(str(entry.get("raw_text") or entry.get("text") or ""))
+        if not candidates:
+            continue
+        quote = candidates[0]
+        source_label = str(entry.get("source") or "unknown")
+        page = str(entry.get("page") or "").strip()
+        source_meta = f"{source_label}, p. {page}" if page else source_label
+        lines.append(f'<i>"{html.escape(quote)}"</i>')
+        lines.append(f"{html.escape(source_meta)} ({entry.get('cid', 'C?')})")
+        quote_count += 1
+
+    if quote_count == 0:
+        return _citation_refusal_response()
+
+    lines.append("")
+    lines.append("So what: Use this as reference context, then execute against house specs and station needs.")
+    return "\n".join(lines).strip()
+
+
+def _strip_invalid_chunk_refs(answer: str, allowed_chunk_ids: Sequence[str]) -> str:
+    allowed = {value.upper() for value in allowed_chunk_ids}
+
+    def _replace(match: re.Match[str]) -> str:
+        value = f"C{match.group(1)}".upper()
+        return f"({value})" if value in allowed else ""
+
+    cleaned = CHUNK_REF_RE.sub(_replace, answer or "")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+\n", "\n", cleaned)
+    return cleaned.strip()
+
+
+def chat(
+    messages: List[Tuple[str, str]],
+    *,
+    response_style: Optional[str] = None,
+    mode: Optional[str] = None,
+) -> str:
     config = load_config()
 
     ollama_url = os.environ.get("OLLAMA_URL") or config.get("ollama", {}).get(
         "base_url", "http://localhost:11434"
     )
     model = config.get("ollama", {}).get("model", "gpt-oss:20b")
-    base_system_prompt = config.get("system_prompt", "You are a helpful assistant.")
-    system_prompt = (
-        f"{base_system_prompt.rstrip()}\n\n"
-        f"{CHEF_CARD_STYLE_APPENDIX}\n\n"
-        f"{GROUNDING_RULE_APPENDIX}\n\n"
-        f"{ANTI_REPETITION_RULE_APPENDIX}\n\n"
-        f"{SOURCE_GROUNDED_AUTHOR_RULE_APPENDIX}\n\n"
-        f"{RECIPE_AUTHORITY_RULE_APPENDIX}\n\n"
-        f"{COMPONENT_FIRST_RULE_APPENDIX}"
-    ).strip()
-
     rag_enabled = bool(config.get("rag", {}).get("enabled", False))
+    base_system_prompt = config.get("system_prompt", "You are a helpful assistant.")
+    style_name = _resolve_response_style(config, response_style=response_style, mode=mode)
+    style_block = STYLE_APPENDIX_BY_NAME.get(style_name, STYLE_APPENDIX_BY_NAME["concise"])
+    system_prompt = f"{base_system_prompt.rstrip()}\n\n{style_block}\n\n{GROUNDING_APPENDIX}".strip()
 
     last_user_message: Optional[Tuple[str, str]] = next(
         (m for m in reversed(messages) if m[0] == "user"), None
@@ -531,39 +498,41 @@ def chat(messages: List[Tuple[str, str]]) -> str:
             logger.exception("House recipe assembly failed for query=%s", query_text)
 
     payload_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    context_entries: List[Dict[str, Any]] = []
 
-    if rag_enabled:
-        if query_text:
-            try:
-                rag_reference = _build_rag_reference_context(query_text=query_text, config=config)
-                payload_messages.append({"role": "system", "content": rag_reference})
-            except Exception as exc:
-                logger.exception("RAG integration error")
-                payload_messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "REFERENCE CONTEXT (RAG)\n"
-                            f"QUERY: {query_text}\n"
-                            "RETRIEVED_CHUNK_COUNT: 0\n"
-                            f"RAG_ERROR: {exc}\n"
-                            "No RAG chunks were injected due to an integration error."
-                        ),
-                    }
-                )
-        else:
-            logger.warning("RAG is enabled but no user query was found in message history.")
+    if rag_enabled and query_text:
+        try:
+            rag_reference, context_entries, _ = _build_rag_reference_context(
+                query_text=query_text,
+                config=config,
+            )
+            payload_messages.append({"role": "system", "content": rag_reference})
+        except Exception as exc:
+            logger.exception("RAG integration error")
             payload_messages.append(
                 {
                     "role": "system",
                     "content": (
-                        "REFERENCE CONTEXT (RAG)\n"
-                        "QUERY: NONE\n"
+                        "CONTEXT (RAG)\n"
+                        f"QUERY: {query_text}\n"
                         "RETRIEVED_CHUNK_COUNT: 0\n"
-                        "No user query was available for retrieval."
+                        f"RAG_ERROR: {exc}\n"
+                        "NO_CONTEXT=true"
                     ),
                 }
             )
+            context_entries = []
+
+    if _is_citation_request(query_text):
+        return _build_grounded_quote_response(query_text=query_text, context_entries=context_entries)
+
+    if rag_enabled and query_text and not context_entries:
+        payload_messages.append(
+            {
+                "role": "system",
+                "content": "If no relevant context exists, answer with: Not in my sources yet.",
+            }
+        )
 
     payload_messages.extend([{"role": role, "content": content} for role, content in messages])
 
@@ -583,7 +552,11 @@ def chat(messages: List[Tuple[str, str]]) -> str:
         response = requests.post(f"{ollama_url}/api/chat", json=payload, timeout=180)
         response.raise_for_status()
         data = response.json()
-        return (data.get("message") or {}).get("content", "").strip() or "(No response.)"
+        answer = (data.get("message") or {}).get("content", "").strip() or "(No response.)"
+        if context_entries:
+            allowed = [str(item.get("cid") or "").upper() for item in context_entries]
+            answer = _strip_invalid_chunk_refs(answer, allowed)
+        return answer
     except Exception as exc:
         logger.error("Error connecting to Brain: %s", exc)
         return f"Error connecting to Brain: {exc}"

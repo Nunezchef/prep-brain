@@ -46,7 +46,7 @@ from services.memory import (
     get_recent_messages,
     init_db,
 )
-from services.tg_format import tg_escape
+from services.tg_format import tg_escape, tg_render_answer
 from services.transcriber import transcribe_file
 from prep_brain.config import load_config, resolve_path
 
@@ -483,117 +483,15 @@ def _format_assistant_card(raw_text: str, user_query: Optional[str] = None) -> s
     if _looks_like_house_recipe_html(raw_text):
         return (raw_text or "").strip()
 
-    if _is_component_recipe_query(user_query):
-        return _format_component_recipe_html(raw_text=raw_text, user_query=user_query)
-
-    if _looks_like_card(raw_text):
+    if _looks_like_card(raw_text) or re.search(r"<(?:b|i|code|pre|u|s|a)(?:\s|>)", raw_text or "", re.I):
         return (raw_text or "").strip()
 
-    cleaned = _strip_markdown(raw_text)
-    if not cleaned:
-        return _build_kitchen_card_html(
-            title="Kitchen Note",
-            summary="I could not generate a response.",
-            key_points=[
-                "Try the question again with one clear goal.",
-                "Include dish, station, or service context.",
-                "Keep constraints explicit.",
-            ],
-            kitchen_lines=["I can answer quickly once the target is specific."],
-        )
+    rendered = tg_render_answer(raw_text)
+    if rendered:
+        return rendered
 
-    lines = [line.strip() for line in cleaned.split("\n") if line.strip()]
-    bullet_pattern = re.compile(r"^(?:[-•*]|\d+[\.)])\s+(.+)$")
-    title = "Kitchen Note"
-    for line in lines:
-        candidate = re.sub(r"^[\-•*\d\.)\s]+", "", line).strip(" :-")
-        if candidate and len(candidate.split()) <= 12:
-            title = _truncate(candidate, 60).title()
-            break
-
-    non_bullet_lines = [
-        line
-        for line in lines
-        if not bullet_pattern.match(line)
-        and not line.lower().startswith("key points")
-        and not line.lower().startswith("in the kitchen")
-    ]
-    sentence_source = " ".join(non_bullet_lines) if non_bullet_lines else cleaned
-    sentences = _extract_sentences(sentence_source)
-    summary = sentences[0] if sentences else cleaned
-
-    key_points: List[str] = []
-    for line in lines:
-        match = bullet_pattern.match(line)
-        if match:
-            key_points.append(match.group(1).strip())
-
-    if not key_points:
-        key_points.extend(sentences[1:6])
-
-    if not key_points:
-        key_points.extend(lines[1:6])
-
-    deduped_points: List[str] = []
-    seen = set()
-    for point in key_points:
-        normalized = " ".join(point.split()).strip()
-        lowered = normalized.lower()
-        if normalized and lowered not in seen:
-            deduped_points.append(normalized)
-            seen.add(lowered)
-
-    fallback_points = [
-        "Clarify quantities, timing, and constraints early.",
-        "Keep station workflow and prep order explicit.",
-        "Confirm edge cases before service.",
-    ]
-    for fallback in fallback_points:
-        if len(deduped_points) >= 3:
-            break
-        if fallback.lower() not in seen:
-            deduped_points.append(fallback)
-            seen.add(fallback.lower())
-
-    kitchen_lines: List[str] = []
-    for idx, line in enumerate(lines):
-        if line.lower().startswith("in the kitchen"):
-            after_colon = line.split(":", 1)[1].strip() if ":" in line else ""
-            if after_colon:
-                kitchen_lines.append(after_colon)
-            for next_line in lines[idx + 1 : idx + 3]:
-                if bullet_pattern.match(next_line):
-                    continue
-                if next_line.lower().startswith("key points"):
-                    continue
-                if next_line.lower().startswith("in the kitchen"):
-                    continue
-                kitchen_lines.append(next_line)
-            break
-
-    if not kitchen_lines:
-        for line in non_bullet_lines[1:3]:
-            kitchen_lines.append(line)
-
-    if not kitchen_lines:
-        kitchen_lines = [
-            "Apply this directly to prep planning and service timing.",
-            "Adjust by station load and team constraints.",
-        ]
-
-    ask_line: Optional[str] = None
-    for sentence in sentences[1:]:
-        if sentence.endswith("?"):
-            ask_line = sentence
-            break
-
-    return _build_kitchen_card_html(
-        title=title,
-        summary=summary,
-        key_points=deduped_points[:5],
-        kitchen_lines=kitchen_lines[:2],
-        ask=ask_line,
-    )
+    _ = user_query
+    return "Not in my sources yet.\nTry a narrower query or reingest/OCR the source."
 
 
 async def _send_html_reply(update: Update, formatted_text: str) -> None:
@@ -1349,7 +1247,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         history = get_recent_messages(session_id, limit=16)
         logger.info("Calling Brain with history length: %s", len(history))
-        answer = chat(history)
+        chat_mode = str(context.chat_data.get("mode") or "service").strip().lower()
+        response_style = "chef_card" if chat_mode == "admin" else "concise"
+        answer = chat(history, response_style=response_style, mode=chat_mode)
         logger.info("Brain Answer: %s...", answer[:50])
         formatted_answer = _format_assistant_card(answer, user_query=text)
     except Exception as exc:
@@ -1500,7 +1400,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             history = get_recent_messages(session_id, limit=16)
             logger.info("Sending context to Ollama...")
-            answer = chat(history)
+            chat_mode = str(context.chat_data.get("mode") or "service").strip().lower()
+            response_style = "chef_card" if chat_mode == "admin" else "concise"
+            answer = chat(history, response_style=response_style, mode=chat_mode)
             logger.info("Brain Answer: %s...", answer[:50])
             formatted_answer = _format_assistant_card(answer, user_query=text)
         except Exception as exc:
@@ -2030,7 +1932,9 @@ async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         history = get_recent_messages(session_id, limit=16)
-        answer = chat(history)
+        chat_mode = str(context.chat_data.get("mode") or "service").strip().lower()
+        response_style = "chef_card" if chat_mode == "admin" else "concise"
+        answer = chat(history, response_style=response_style, mode=chat_mode)
         fmt = _format_assistant_card(answer, user_query=query)
         add_message(session_id, "assistant", _to_plain_text(fmt))
 
