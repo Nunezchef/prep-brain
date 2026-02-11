@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 import uuid
 from datetime import datetime
@@ -362,13 +363,21 @@ class AutonomyWorker:
             return
         sql = ", ".join(f"{key} = ?" for key in updates.keys())
         params = list(updates.values()) + [1]
-        con = memory.get_conn()
-        try:
-            con.execute("INSERT OR IGNORE INTO autonomy_status (id, is_running) VALUES (1, 0)")
-            con.execute(f"UPDATE autonomy_status SET {sql} WHERE id = ?", params)
-            con.commit()
-        finally:
-            con.close()
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            con = memory.get_conn()
+            try:
+                con.execute("INSERT OR IGNORE INTO autonomy_status (id, is_running) VALUES (1, 0)")
+                con.execute(f"UPDATE autonomy_status SET {sql} WHERE id = ?", params)
+                con.commit()
+                return
+            except sqlite3.OperationalError as exc:
+                if "database is locked" in str(exc).lower() and attempt < max_attempts:
+                    time.sleep(0.05 * attempt)
+                    continue
+                raise
+            finally:
+                con.close()
 
     def _refresh_status_queues(self, *, action: Optional[str] = None) -> None:
         con = memory.get_conn()
@@ -422,15 +431,23 @@ class AutonomyWorker:
             updates.append("started_at = COALESCE(started_at, CURRENT_TIMESTAMP)")
         if finished:
             updates.append("finished_at = CURRENT_TIMESTAMP")
-        con = memory.get_conn()
-        try:
-            con.execute(
-                f"UPDATE ingest_jobs SET {', '.join(updates)} WHERE id = ?",
-                tuple(params + [int(job_id)]),
-            )
-            con.commit()
-        finally:
-            con.close()
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            con = memory.get_conn()
+            try:
+                con.execute(
+                    f"UPDATE ingest_jobs SET {', '.join(updates)} WHERE id = ?",
+                    tuple(params + [int(job_id)]),
+                )
+                con.commit()
+                return
+            except sqlite3.OperationalError as exc:
+                if "database is locked" in str(exc).lower() and attempt < max_attempts:
+                    time.sleep(0.05 * attempt)
+                    continue
+                raise
+            finally:
+                con.close()
 
     def _classify_needs_review_reason(
         self, *, report: Optional[Dict[str, Any]], source_type: str
@@ -460,27 +477,37 @@ class AutonomyWorker:
         conf_before: float = 0.0,
         conf_after: float = 0.0,
     ) -> None:
-        con = memory.get_conn()
-        try:
-            con.execute(
-                """
-                INSERT INTO autonomy_log (action, target_type, target_id, detail, confidence_before, confidence_after)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    action,
-                    target_type,
-                    str(target_id) if target_id is not None else None,
-                    self._redact_sensitive(detail)[:4000],
-                    conf_before,
-                    conf_after,
-                ),
-            )
-            con.commit()
-        except Exception as exc:
-            logger.error("Failed to log autonomy action: %s", exc)
-        finally:
-            con.close()
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            con = memory.get_conn()
+            try:
+                con.execute(
+                    """
+                    INSERT INTO autonomy_log (action, target_type, target_id, detail, confidence_before, confidence_after)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        action,
+                        target_type,
+                        str(target_id) if target_id is not None else None,
+                        self._redact_sensitive(detail)[:4000],
+                        conf_before,
+                        conf_after,
+                    ),
+                )
+                con.commit()
+                return
+            except sqlite3.OperationalError as exc:
+                if "database is locked" in str(exc).lower() and attempt < max_attempts:
+                    time.sleep(0.05 * attempt)
+                    continue
+                logger.error("Failed to log autonomy action: %s", exc)
+                return
+            except Exception as exc:
+                logger.error("Failed to log autonomy action: %s", exc)
+                return
+            finally:
+                con.close()
 
     def _has_recent_log(
         self,

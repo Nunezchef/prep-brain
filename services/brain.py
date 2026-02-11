@@ -185,7 +185,9 @@ def _is_component_assembly_chunk(chunk: Dict[str, Any]) -> bool:
     return any(term in haystack for term in COMPONENT_ASSEMBLY_EXCLUSION_TERMS)
 
 
-def _filter_component_results(query_text: str, results: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _filter_component_results(
+    query_text: str, results: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     if not _is_component_query(query_text) or not results:
         return results, {
             "component_query": False,
@@ -232,6 +234,12 @@ def _truncate(text: str, limit: int = 220) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return f"{cleaned[:limit]}..."
+
+
+def _query_log_preview(query_text: str, limit: int = 240) -> str:
+    preview = _truncate(query_text or "", limit=limit)
+    length = len(str(query_text or ""))
+    return f"{preview} [len={length}]"
 
 
 def _source_snapshot(rag_engine, limit: int = 5) -> str:
@@ -355,7 +363,7 @@ def _build_rag_reference_context(query_text: str, config: Dict[str, Any]) -> str
 
     from services.rag import rag_engine
 
-    logger.info("RAG query string: %s", query_text)
+    logger.info("RAG query string: %s", _query_log_preview(query_text))
 
     results, routing = _retrieve_rag_results(query_text=query_text, top_k=top_k)
     retrieved_count = len(results)
@@ -449,7 +457,9 @@ def _build_rag_reference_context(query_text: str, config: Dict[str, Any]) -> str
                 f"[{idx}] source={source} | tier={tier} | heading={heading} | distance={distance}\n{content}"
             )
     else:
-        logger.warning("RAG retrieval returned 0 chunks for query: %s", query_text)
+        logger.warning(
+            "RAG retrieval returned 0 chunks for query: %s", _query_log_preview(query_text)
+        )
         context_lines.extend(
             [
                 "",
@@ -464,7 +474,9 @@ def _build_rag_reference_context(query_text: str, config: Dict[str, Any]) -> str
 def chat(messages: List[Tuple[str, str]]) -> str:
     config = load_config()
 
-    ollama_url = os.environ.get("OLLAMA_URL") or config.get("ollama", {}).get("base_url", "http://localhost:11434")
+    ollama_url = os.environ.get("OLLAMA_URL") or config.get("ollama", {}).get(
+        "base_url", "http://localhost:11434"
+    )
     model = config.get("ollama", {}).get("model", "gpt-oss:20b")
     base_system_prompt = config.get("system_prompt", "You are a helpful assistant.")
     system_prompt = (
@@ -479,11 +491,17 @@ def chat(messages: List[Tuple[str, str]]) -> str:
 
     rag_enabled = bool(config.get("rag", {}).get("enabled", False))
 
-    last_user_message: Optional[Tuple[str, str]] = next((m for m in reversed(messages) if m[0] == "user"), None)
+    last_user_message: Optional[Tuple[str, str]] = next(
+        (m for m in reversed(messages) if m[0] == "user"), None
+    )
     query_text = (last_user_message[1].strip() if last_user_message else "") if messages else ""
 
     if rag_enabled and query_text and _is_recipe_query(query_text):
-        recipe_cfg = config.get("rag", {}).get("recipes", {}) if isinstance(config.get("rag", {}), dict) else {}
+        recipe_cfg = (
+            config.get("rag", {}).get("recipes", {})
+            if isinstance(config.get("rag", {}), dict)
+            else {}
+        )
         recipe_conf_threshold = float(recipe_cfg.get("completeness_confidence_threshold", 0.75))
         try:
             from services.rag import rag_engine
