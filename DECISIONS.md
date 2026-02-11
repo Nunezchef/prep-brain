@@ -14,3 +14,6 @@ Telegram command surface is defined in the command registry and used for `/help`
 
 ## 5) Central Config Loader
 Config is loaded through one interface (`prep_brain.config`) to reduce drift and DB path inconsistencies.
+
+## 6) Brevity + Grounded Citations
+Default response style is concise (service mode). Citation/quote replies are grounded strictly in retrieved chunks, with deterministic refusal when no relevant context exists.
