@@ -111,3 +111,9 @@ lexicon:
 debug:
   enabled: false
   ingest_report: false
+
+backup:
+  enabled: true
+  directory: data/backups
+  retention_days: 7
+  interval_hours: 24

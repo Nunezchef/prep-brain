@@ -1,6 +1,7 @@
 import pytest
 import sqlite3
 import os
+from pathlib import Path
 from services import providers, memory
 
 # Use a test database
@@ -10,7 +11,7 @@ TEST_DB = "test_memory.db"
 def setup_teardown():
     # Setup: Override DB path for testing
     original_db_path = memory.DB_PATH
-    memory.DB_PATH = providers.DB_PATH = providers.Path(TEST_DB)
+    memory.DB_PATH = Path(TEST_DB)
     
     # Initialize DB (creates tables)
     memory.init_db()
@@ -22,7 +23,7 @@ def setup_teardown():
         os.remove(TEST_DB)
     
     # Restore DB path
-    memory.DB_PATH = providers.DB_PATH = original_db_path
+    memory.DB_PATH = original_db_path
 
 def test_create_vendor():
     data = {

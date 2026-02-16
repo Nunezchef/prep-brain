@@ -1028,29 +1028,10 @@ def execute_command(
         return _json_or_text(req, payload, tg_card("Status", lines))
 
     if name == "health":
-        db_ok = False
-        rag_ok = False
-        try:
-            con = _conn()
-            con.execute("SELECT 1").fetchone()
-            con.close()
-            db_ok = True
-        except Exception:
-            db_ok = False
+        from services.health import get_system_health, format_health_telegram
 
-        try:
-            _ = rag_engine.get_sources()
-            rag_ok = True
-        except Exception:
-            rag_ok = False
-
-        lines = [
-            f"db {'ok' if db_ok else 'fail'}",
-            f"rag {'ok' if rag_ok else 'fail'}",
-            f"time {datetime.now().strftime('%H:%M:%S')}",
-        ]
-        payload = {"db_ok": db_ok, "rag_ok": rag_ok}
-        return _json_or_text(req, payload, tg_card("Health", lines))
+        health_status = get_system_health()
+        return CommandResponse(text=format_health_telegram(health_status))
 
     if name == "prep":
         args = req.args or []

@@ -10,7 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from services import brain, costing, memory, notifier, prep_list, rag, recipes
+from services import brain, costing, memory, notifier, prep_list, rag, recipes, backup
+from services import metrics
 from services.web_research import WebResearchClient
 from prep_brain.config import load_config, resolve_path
 
@@ -63,7 +64,7 @@ def _sanitize_error_text(raw: Any, limit: int = 400) -> str:
             cleaned = pattern.sub("Bearer [REDACTED]", cleaned)
         else:
             cleaned = pattern.sub(r"\1=[REDACTED]", cleaned)
-    return cleaned[:limit]
+    return str(cleaned)[:limit]
 
 
 def normalize_job_source_type(source_type: str, knowledge_tier: Optional[str] = None) -> str:
@@ -91,7 +92,7 @@ def queue_ingest_job(
     source_filename: str,
     source_type: str,
     restaurant_tag: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> Dict[str, Any]:  # type: ignore
     ingest_id = uuid.uuid4().hex
     normalized_type = normalize_job_source_type(source_type)
     file_path = resolve_path("data/documents") / str(source_filename or "").strip()
@@ -161,7 +162,7 @@ def queue_ingest_job(
         con.close()
 
 
-def list_ingest_jobs(limit: int = 5) -> List[Dict[str, Any]]:
+def list_ingest_jobs(limit: int = 5) -> List[Dict[str, Any]]:  # type: ignore
     con = memory.get_conn()
     try:
         rows = con.execute(
@@ -187,7 +188,7 @@ def get_ingest_job(job_id: int) -> Optional[Dict[str, Any]]:
         con.close()
 
 
-def get_autonomy_status_snapshot() -> Dict[str, Any]:
+def get_autonomy_status_snapshot() -> Dict[str, Any]:  # type: ignore
     con = memory.get_conn()
     try:
         row = con.execute("SELECT * FROM autonomy_status WHERE id = 1").fetchone()
@@ -230,13 +231,17 @@ class AutonomyWorker:
         self.ingest_completion_message = bool(autonomy_cfg.get("ingest_completion_message", False))
         self.alert_cooldown_minutes = int(autonomy_cfg.get("alert_cooldown_minutes", 180))
         self.auto_promote_threshold = float(
-            autonomy_cfg.get("auto_promote_threshold", default_promote_threshold)
+            str(autonomy_cfg.get("auto_promote_threshold", default_promote_threshold))
         )
         self.enrich_min_confidence = float(
-            autonomy_cfg.get("enrich_min_confidence", default_enrich_min)
+            str(autonomy_cfg.get("enrich_min_confidence", default_enrich_min))
         )
         self.enrich_attempt_band_max = float(
-            autonomy_cfg.get("enrich_attempt_band_max", self.auto_promote_threshold - 0.01)
+            str(
+                autonomy_cfg.get(
+                    "enrich_attempt_band_max", self.auto_promote_threshold - 0.01
+                )
+            )
         )
         self.draft_scan_limit = int(autonomy_cfg.get("draft_scan_limit", 10))
         self.max_source_chunks_per_draft = int(autonomy_cfg.get("max_source_chunks_per_draft", 12))
@@ -246,8 +251,8 @@ class AutonomyWorker:
         )
         self.web_enabled = bool(web_cfg.get("enabled", False))
         self.web_mode = str(web_cfg.get("mode", "research_only")).strip().lower()
-        self.web_rate_limit_rps = float(web_cfg.get("rate_limit_rps", 0.5))
-        self.web_max_pages_per_task = int(web_cfg.get("max_pages_per_task", 3))
+        self.web_rate_limit_rps = float(str(web_cfg.get("rate_limit_rps") or 0.5))
+        self.web_max_pages_per_task = int(str(web_cfg.get("max_pages_per_task", 3)))
         self.web_allowed_domains = [
             str(d).strip() for d in web_cfg.get("allowed_domains", []) if str(d).strip()
         ]
@@ -258,7 +263,7 @@ class AutonomyWorker:
         self._last_maintenance_cycle_at: float = 0.0
         self._is_tick_running = False
         self.web_client: Optional[WebResearchClient] = None
-        self._lock_handle = None
+        self._lock_handle: Optional[Any] = None
         self._lock_path = resolve_path("run/autonomy.singleton.lock")
         self._singleton_owner = False
 
@@ -291,12 +296,18 @@ class AutonomyWorker:
             return True
         try:
             self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-            self._lock_handle = open(self._lock_path, "a+")
-            fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._lock_handle.seek(0)
-            self._lock_handle.truncate(0)
-            self._lock_handle.write(str(os.getpid()))
-            self._lock_handle.flush()
+            # Capture in local variable to satisfy static analysis
+            handle = open(self._lock_path, "a+")
+            self._lock_handle = handle
+            
+            if handle is None:
+                return False
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            handle.seek(0)
+            handle.truncate(0)
+            handle.write(str(os.getpid()))
+            handle.flush()
             self._singleton_owner = True
             return True
         except Exception:
@@ -653,8 +664,8 @@ class AutonomyWorker:
                     "inventory_item_id": None,
                     "item_name_text": item_name[:200],
                     "quantity": _safe_float(ingredient.get("quantity")),
-                    "unit": " ".join(str(ingredient.get("unit", "")).split())[:50] or None,
-                    "notes": " ".join(str(ingredient.get("notes", "")).split())[:500] or None,
+                    "unit": str(" ".join(str(ingredient.get("unit", "")).split()))[:50] or None,
+                    "notes": str(" ".join(str(ingredient.get("notes", "")).split()))[:500] or None,
                 }
             )
         return cleaned
@@ -872,10 +883,12 @@ class AutonomyWorker:
         )
 
     def _web_estimate_missing_costs(self, con) -> int:
-        if not self.web_client or not self.web_enabled or self.web_mode != "research_only":
+        # Use a local variable to satisfy strict type checking (Self.web_client could change)
+        client = self.web_client
+        if not client or not self.web_enabled or self.web_mode != "research_only":
             return 0
 
-        estimated = 0
+        estimated: int = 0
         seen: Set[str] = set()
         rows = con.execute("""
             SELECT
@@ -906,7 +919,7 @@ class AutonomyWorker:
                 continue
 
             try:
-                estimate = self.web_client.research_price_estimate(
+                estimate = client.research_price_estimate(
                     item_name=ingredient_name,
                     unit=str(row["ingredient_unit"] or "unit"),
                 )
@@ -936,7 +949,7 @@ class AutonomyWorker:
                 source_urls=[str(url) for url in estimate.get("source_urls", []) if str(url)],
                 retrieved_at=str(estimate.get("retrieved_at", "")) or None,
             )
-            estimated += 1
+            estimated += 1  # type: ignore
             self.log_action(
                 "web_price_estimate_created",
                 target_type="ingredient_name",
@@ -1103,7 +1116,7 @@ class AutonomyWorker:
                     """,
                     (source_id, draft_name, raw_text, confidence, tier),
                 )
-                created += 1
+                created += 1  # type: ignore
 
                 self.log_action(
                     "evaluate_document",
@@ -1284,9 +1297,9 @@ class AutonomyWorker:
                         (
                             name_value,
                             _safe_float(parsed.get("yield_amount")),
-                            " ".join(str(parsed.get("yield_unit") or "").split())[:50] or None,
-                            " ".join(str(parsed.get("station") or "").split())[:100] or None,
-                            " ".join(str(parsed.get("category") or "").split())[:100] or None,
+                            str(" ".join(str(parsed.get("yield_unit") or "").split()))[:50] or None,
+                            str(" ".join(str(parsed.get("station") or "").split()))[:100] or None,
+                            str(" ".join(str(parsed.get("category") or "").split()))[:100] or None,
                             method_value,
                             json.dumps(ingredients),
                             json.dumps(allergens_list),
@@ -1556,7 +1569,7 @@ class AutonomyWorker:
     async def reconcile_inventory(self):
         """Link ingredient lines to inventory items and refresh recipe costs."""
         con = memory.get_conn()
-        linked = 0
+        linked: int = 0
         estimated_prices = 0
         active_recipe_ids: List[int] = []
 
@@ -1601,11 +1614,11 @@ class AutonomyWorker:
                     (match_id, ingredient_id),
                 )
                 touched_recipes.add(recipe_id)
-                linked += 1
+                linked += 1  # type: ignore
                 self.log_action(
                     "reconcile_inventory_link",
                     target_type="recipe_ingredient",
-                    target_id=ingredient_id,
+                    target_id=str(ingredient_id),
                     detail=f"Linked '{ingredient_name}' -> inventory item {match_id}",
                 )
 
@@ -1987,6 +2000,8 @@ class AutonomyWorker:
             return
 
         self._is_tick_running = True
+        start_ts = time.time()
+        success = True
         try:
             self._set_status(
                 is_running=1, last_tick_at=datetime.now().isoformat(), last_action="tick"
@@ -2039,7 +2054,13 @@ class AutonomyWorker:
             # Full maintenance cycle on configured interval.
             if (now_ts - self._last_maintenance_cycle_at) >= max(60, int(self.interval)):
                 await self.run_cycle()
+
+            # Database backup check
+            if backup.run_backup_if_due():
+                self.log_action("backup_created", detail="Automated database backup completed.")
+
         except Exception as exc:
+            success = False
             self._set_status(
                 is_running=1,
                 last_action="tick_error",
@@ -2052,7 +2073,14 @@ class AutonomyWorker:
                 target_id="tick",
                 detail=str(exc),
             )
+            self._alert_if_required(
+                alert_key="autonomy_tick_crash",
+                message=f"🚨 **Autonomy Loop Crashed**\nError: `{_sanitize_error_text(exc)}`\nCheck logs for details.",
+                throttle_minutes=60,
+            )
         finally:
+            duration_ms = (time.time() - start_ts) * 1000
+            metrics.record_autonomy_tick(action="tick", duration_ms=duration_ms, success=success)
             self._refresh_status_queues(action="tick_done")
             self._is_tick_running = False
 

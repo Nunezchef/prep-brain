@@ -1,5 +1,6 @@
 import pytest
 import os
+from pathlib import Path
 from services import order_guide, providers, memory
 
 TEST_DB = "test_order_guide.db"
@@ -7,7 +8,7 @@ TEST_DB = "test_order_guide.db"
 @pytest.fixture(autouse=True)
 def setup_teardown():
     original_db_path = memory.DB_PATH
-    memory.DB_PATH = providers.DB_PATH = order_guide.DB_PATH = order_guide.Path(TEST_DB)
+    memory.DB_PATH = Path(TEST_DB)
     
     memory.init_db()
     
@@ -19,7 +20,7 @@ def setup_teardown():
     if os.path.exists(TEST_DB):
         os.remove(TEST_DB)
     
-    memory.DB_PATH = providers.DB_PATH = order_guide.DB_PATH = original_db_path
+    memory.DB_PATH = original_db_path
 
 def test_add_item():
     vendors = providers.get_all_vendors()

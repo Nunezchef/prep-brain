@@ -3,6 +3,7 @@ import logging
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 from services import memory
+from services.soft_delete import soft_delete, get_active_where_clause
 
 DB_PATH = memory.get_db_path()
 
@@ -50,10 +51,10 @@ def update_area_order(updates: List[tuple]) -> str:
 # --- Inventory Items ---
 
 def create_item(data: Dict[str, Any]) -> str:
-    """Create or update an inventory item."""
+    """Create or update an inventory item. Restores if soft-deleted."""
     con = _get_conn()
     try:
-        # Check if exists to update
+        # Check if exists (including soft deleted)
         cur = con.execute("SELECT id FROM inventory_items WHERE name = ?", (data["name"],))
         row = cur.fetchone()
         
@@ -61,8 +62,11 @@ def create_item(data: Dict[str, Any]) -> str:
         filtered_data = {k: data.get(k) for k in keys if k in data}
         
         if row:
-            # Update
+            # Update and implicitly restore if deleted
             set_clause = ", ".join([f"{k} = ?" for k in filtered_data])
+            # Explicitly set deleted_at to NULL to restore
+            set_clause += ", deleted_at = NULL"
+            
             values = tuple(filtered_data.values()) + (data["name"],)
             con.execute(f"UPDATE inventory_items SET {set_clause}, updated_at=CURRENT_TIMESTAMP WHERE name = ?", values)
             msg = f"Item '{data['name']}' updated."
@@ -91,8 +95,8 @@ def get_sheet_data() -> Dict[str, List[dict]]:
         area_map = {a['id']: a['name'] for a in areas}
         area_map[None] = "Unassigned"
         
-        # Get Items
-        cur = con.execute("SELECT * FROM inventory_items ORDER BY sort_order, name")
+        # Get Items (Active only)
+        cur = con.execute(f"SELECT * FROM inventory_items WHERE {get_active_where_clause()} ORDER BY sort_order, name")
         items = [dict(row) for row in cur.fetchall()]
         
         # Group
@@ -126,8 +130,8 @@ def submit_count(counts: List[Dict[str, Any]], user: str = "Unknown") -> str:
             if item_id is None or new_qty is None:
                 continue
                 
-            # Get current state for history
-            cur = con.execute("SELECT name, quantity FROM inventory_items WHERE id = ?", (item_id,))
+            # Get current state for history (Active only)
+            cur = con.execute(f"SELECT name, quantity FROM inventory_items WHERE id = ? AND {get_active_where_clause()}", (item_id,))
             row = cur.fetchone()
             if not row:
                 continue
@@ -164,8 +168,12 @@ def get_inventory_value() -> float:
     """Calculate total value of inventory on hand."""
     con = _get_conn()
     try:
-        cur = con.execute("SELECT SUM(quantity * cost) as total_value FROM inventory_items")
+        cur = con.execute(f"SELECT SUM(quantity * cost) as total_value FROM inventory_items WHERE {get_active_where_clause()}")
         row = cur.fetchone()
         return row["total_value"] or 0.0
     finally:
         con.close()
+
+def delete_item(item_id: int, actor: str = "System") -> bool:
+    """Soft delete an inventory item."""
+    return soft_delete("inventory_items", item_id, actor)

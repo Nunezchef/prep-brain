@@ -3,6 +3,7 @@ import logging
 import pandas as pd
 from typing import List, Optional, Dict, Any
 from services import memory, costing
+from services.soft_delete import soft_delete, get_active_where_clause
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ def get_menu_items() -> List[dict]:
     """Get all active menu items."""
     con = _get_conn()
     try:
-        cur = con.execute("SELECT * FROM menu_items WHERE is_active = 1 ORDER BY category, name")
+        cur = con.execute(f"SELECT * FROM menu_items WHERE is_active = 1 AND {get_active_where_clause()} ORDER BY category, name")
         return [dict(row) for row in cur.fetchall()]
     finally:
         con.close()
@@ -79,7 +80,7 @@ def get_matrix_data() -> pd.DataFrame:
                 SUM(sl.quantity_sold) as total_sold
             FROM menu_items mi
             JOIN sales_log sl ON mi.id = sl.menu_item_id
-            WHERE sl.quantity_sold > 0
+            WHERE sl.quantity_sold > 0 AND {get_active_where_clause('mi')}
             GROUP BY mi.id
             """, con
         )
@@ -129,3 +130,7 @@ def get_matrix_data() -> pd.DataFrame:
         
     finally:
         con.close()
+
+def delete_menu_item(item_id: int, actor: str = "System") -> bool:
+    """Soft delete a menu item."""
+    return soft_delete("menu_items", item_id, actor)

@@ -14,4 +14,6 @@ fastapi
 uvicorn
 python-multipart
 pytest
+pytest-cov
+pytest-asyncio
 python-docx

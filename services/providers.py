@@ -2,6 +2,7 @@ import sqlite3
 import logging
 from typing import List, Optional, Dict, Any
 from services import memory
+from services.soft_delete import soft_delete, get_active_where_clause
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ def get_all_vendors() -> List[dict]:
     """Get all vendors."""
     con = _get_conn()
     try:
-        cur = con.execute("SELECT * FROM vendors ORDER BY name")
+        cur = con.execute(f"SELECT * FROM vendors WHERE {get_active_where_clause()} ORDER BY name")
         return [dict(row) for row in cur.fetchall()]
     finally:
         con.close()
@@ -76,21 +77,14 @@ def get_vendor(vendor_id: int) -> Optional[dict]:
     """Get a single vendor by ID."""
     con = _get_conn()
     try:
-        cur = con.execute("SELECT * FROM vendors WHERE id = ?", (vendor_id,))
+        cur = con.execute(f"SELECT * FROM vendors WHERE id = ? AND {get_active_where_clause()}", (vendor_id,))
         row = cur.fetchone()
         return dict(row) if row else None
     finally:
         con.close()
 
-def delete_vendor(vendor_id: int) -> str:
-    """Delete a vendor."""
-    con = _get_conn()
-    try:
-        con.execute("DELETE FROM vendors WHERE id = ?", (vendor_id,))
-        con.commit()
+def delete_vendor(vendor_id: int, actor: str = "System") -> str:
+    """Delete a vendor (Soft Delete)."""
+    if soft_delete("vendors", vendor_id, actor):
         return "Vendor deleted successfully."
-    except Exception as e:
-        logger.error(f"Error deleting vendor: {e}")
-        return f"Error deleting vendor: {str(e)}"
-    finally:
-        con.close()
+    return "Error deleting vendor or vendor not found."

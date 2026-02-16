@@ -2,6 +2,7 @@ import sqlite3
 import logging
 from typing import List, Optional, Dict, Any
 from services import memory
+from services.soft_delete import soft_delete, get_active_where_clause
 
 DB_PATH = memory.get_db_path()
 
@@ -79,7 +80,7 @@ def get_all_recipes() -> List[dict]:
     """Get all recipes (summary)."""
     con = _get_conn()
     try:
-        cur = con.execute("SELECT * FROM recipes WHERE is_active = 1 ORDER BY name")
+        cur = con.execute(f"SELECT * FROM recipes WHERE is_active = 1 AND {get_active_where_clause()} ORDER BY name")
         return [dict(row) for row in cur.fetchall()]
     finally:
         con.close()
@@ -89,7 +90,7 @@ def get_recipe_details(recipe_id: int) -> Optional[Dict[str, Any]]:
     con = _get_conn()
     try:
         # Recipe
-        cur = con.execute("SELECT * FROM recipes WHERE id = ?", (recipe_id,))
+        cur = con.execute(f"SELECT * FROM recipes WHERE id = ? AND {get_active_where_clause()}", (recipe_id,))
         recipe_row = cur.fetchone()
         if not recipe_row:
             return None
@@ -98,7 +99,7 @@ def get_recipe_details(recipe_id: int) -> Optional[Dict[str, Any]]:
         
         # Ingredients (Join with inventory for name if linked)
         cur = con.execute(
-            """
+            f"""
             SELECT ri.*, ii.name as inventory_name 
             FROM recipe_ingredients ri
             LEFT JOIN inventory_items ii ON ri.inventory_item_id = ii.id
@@ -116,3 +117,7 @@ def get_recipe_details(recipe_id: int) -> Optional[Dict[str, Any]]:
         return recipe
     finally:
         con.close()
+
+def delete_recipe(recipe_id: int, actor: str = "System") -> bool:
+    """Soft delete a recipe."""
+    return soft_delete("recipes", recipe_id, actor)

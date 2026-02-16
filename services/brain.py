@@ -5,8 +5,12 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
+import time
 
 from prep_brain.config import load_config
+from prep_brain.logging import correlation_context, get_correlation_id
+from services.retry import retry_with_backoff
+from services import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -548,15 +552,32 @@ def chat(
     if "max_tokens" in ollama_cfg:
         payload["num_predict"] = ollama_cfg["max_tokens"]
 
-    try:
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=2.0,
+        max_delay=30.0,
+        retry_on=(requests.exceptions.ConnectionError, requests.exceptions.Timeout, OSError),
+    )
+    def _call_ollama() -> str:
+        cid = get_correlation_id()
+        logger.debug(f"[{cid}] Calling Ollama model={model}")
         response = requests.post(f"{ollama_url}/api/chat", json=payload, timeout=180)
         response.raise_for_status()
         data = response.json()
-        answer = (data.get("message") or {}).get("content", "").strip() or "(No response.)"
+        return (data.get("message") or {}).get("content", "").strip() or "(No response.)"
+
+    start_ts = time.time()
+    success = False
+    try:
+        answer = _call_ollama()
+        success = True
         if context_entries:
             allowed = [str(item.get("cid") or "").upper() for item in context_entries]
             answer = _strip_invalid_chunk_refs(answer, allowed)
         return answer
     except Exception as exc:
-        logger.error("Error connecting to Brain: %s", exc)
+        logger.error("Error connecting to Brain after retries: %s", exc)
         return f"Error connecting to Brain: {exc}"
+    finally:
+        duration_ms = (time.time() - start_ts) * 1000
+        metrics.record_llm_call(model=model, duration_ms=duration_ms, success=success)

@@ -16,10 +16,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import chromadb
 import fitz  # pymupdf
 import requests
+import time
 from chromadb.utils import embedding_functions
 from sentence_transformers import SentenceTransformer
 
-from services import memory
+from services import memory, metrics
 from services.command_runner import CommandRunner
 from services.doc_extract import detect_images_in_docx, extract_docx_images, extract_text
 from prep_brain.config import load_config, resolve_path
@@ -839,6 +840,8 @@ class RAGEngine:
         image_records: List[Dict[str, Any]],
         settings: Dict[str, Any],
     ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        from services.retry import llm_retry
+
         warnings: List[str] = []
         vision_chunks: List[Dict[str, Any]] = []
 
@@ -869,6 +872,12 @@ class RAGEngine:
         )
         max_images = int(vision_cfg.get("max_images", 8))
 
+        @llm_retry
+        def _call_vision_model(payload: Dict[str, Any]) -> str:
+            response = requests.post(f"{base_url}/api/chat", json=payload, timeout=120)
+            response.raise_for_status()
+            return ((response.json().get("message") or {}).get("content") or "").strip()
+
         for image in image_records[:max_images]:
             image_path = Path(image["path"])
             if not image_path.exists():
@@ -888,9 +897,8 @@ class RAGEngine:
                         }
                     ],
                 }
-                response = requests.post(f"{base_url}/api/chat", json=payload, timeout=120)
-                response.raise_for_status()
-                content = ((response.json().get("message") or {}).get("content") or "").strip()
+                
+                content = _call_vision_model(payload)
 
                 if not content:
                     warnings.append(f"Vision model returned no text for {image_path.name}.")
@@ -2107,6 +2115,7 @@ class RAGEngine:
         source_tiers: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Searches active sources from the configured collection for relevant context."""
+        start_ts = time.time()
         try:
             sources = self._load_sources()
             active_entries = [
@@ -2232,6 +2241,13 @@ class RAGEngine:
                         )
                 except Exception as diagnostic_error:
                     logger.warning("RAG retrieval diagnostic failed: %s", diagnostic_error)
+            
+            if metrics:
+                metrics.record_rag_query(
+                    query_type="search",
+                    chunks_retrieved=len(output),
+                    duration_ms=(time.time() - start_ts) * 1000,
+                )
             return output
 
         except Exception as exc:

@@ -4,6 +4,9 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
+import time
+
+from services import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +64,22 @@ class CommandRunner:
         printable_args: List[str] = [_redact_arg(str(part)) for part in args]
         logger.debug("CommandRunner executing: %s", " ".join(printable_args))
 
-        return subprocess.run(
-            [str(part) for part in args],
-            shell=False,
-            check=check,
-            capture_output=capture_output,
-            text=text,
-            timeout=timeout,
-            cwd=cwd,
-        )
+        start_ts = time.time()
+        success = False
+        try:
+            result = subprocess.run(
+                [str(part) for part in args],
+                shell=False,
+                check=check,
+                capture_output=capture_output,
+                text=text,
+                timeout=timeout,
+                cwd=cwd,
+            )
+            success = result.returncode == 0
+            return result
+        except Exception:
+            raise
+        finally:
+            duration_ms = (time.time() - start_ts) * 1000
+            metrics.record_command(command=binary, duration_ms=duration_ms, success=success)

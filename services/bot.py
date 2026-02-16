@@ -6,7 +6,7 @@ import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -18,9 +18,11 @@ from telegram.ext import (
     ContextTypes,
     Defaults,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 from telegram.request import HTTPXRequest
+import uuid
 
 import services.commands as commands
 import services.invoice_ingest as invoice_ingest
@@ -50,6 +52,7 @@ from services.tg_format import tg_escape, tg_render_answer
 from services.transcriber import transcribe_file
 from prep_brain.config import load_config, resolve_path
 from prep_brain.ops import layer as ops_layer
+from prep_brain.logging import set_correlation_id
 
 try:
     import fcntl  # type: ignore
@@ -150,7 +153,7 @@ def _invoice_ingest_enabled() -> bool:
 
 
 def _invoice_vendor_threshold() -> float:
-    return float(_invoice_cfg().get("vendor_confidence_threshold", 0.75))
+    return float(str(_invoice_cfg().get("vendor_confidence_threshold", 0.75)))
 
 
 def _job_source_type(source_type: str, knowledge_tier: str) -> str:
@@ -223,7 +226,7 @@ def _truncate(text: str, limit: int = 220) -> str:
     cleaned = " ".join((text or "").split())
     if len(cleaned) <= limit:
         return cleaned
-    return f"{cleaned[:limit].rstrip()}..."
+    return f"{str(cleaned)[:limit].rstrip()}..."
 
 
 def _strip_markdown(text: str) -> str:
@@ -255,10 +258,10 @@ def _split_for_telegram(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> List[
         if cut < int(limit * 0.40):
             cut = limit
 
-        piece = remaining[:cut].rstrip()
+        piece = str(remaining)[:cut].rstrip()
         if piece:
             chunks.append(piece)
-        remaining = remaining[cut:].lstrip()
+        remaining = str(remaining)[cut:].lstrip()
 
     if remaining:
         chunks.append(remaining)
@@ -635,7 +638,7 @@ async def _process_prep_update_text(
     return True
 
 
-def _ops_success_message(result: Dict[str, object]) -> str:
+def _ops_success_message(result: Dict[str, Any]) -> str:
     name = str(result.get("recipe_name") or "Recipe")
     price = float(result.get("price") or 0.0)
     unit = str(result.get("display_unit") or result.get("unit") or "portion")
@@ -646,8 +649,8 @@ async def _prompt_ops_recipe_choice(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     *,
-    intent: Dict[str, object],
-    choices: List[Dict[str, object]],
+    intent: Dict[str, Any],
+    choices: List[Dict[str, Any]],
 ) -> None:
     if not update.message:
         return
@@ -676,7 +679,7 @@ async def _execute_sales_price_update(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     *,
-    intent: Dict[str, object],
+    intent: Dict[str, Any],
     forced_recipe_id: Optional[int] = None,
 ) -> bool:
     user = update.effective_user
@@ -969,6 +972,8 @@ async def cutoff_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         ordering_config = _ordering_cfg()
         offsets = ordering_config.get("reminder_offsets_minutes", [60, 15])
+        if not isinstance(offsets, list):
+            offsets = [60, 15]
         quiet_hours = ordering_config.get("quiet_hours")
         reminders = ordering.get_due_cutoff_reminders(
             reminder_offsets_minutes=[int(x) for x in offsets],
@@ -1660,7 +1665,7 @@ async def inventory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    report = []
+    report: List[str] = []
     for i in items:
         report.append(f"{i['name']}: {i['quantity']} {i['unit']}")
 
@@ -1672,7 +1677,7 @@ async def inventory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _send_html_reply(
         update,
         _build_kitchen_card_html(
-            "Inventory Status", summary, report[:10], ["Use /count <item> <qty> to update stock."]
+            "Inventory Status", summary, report[0:10], ["Use /count <item> <qty> to update stock."]  # type: ignore
         ),
     )
 
@@ -2104,6 +2109,10 @@ def run_bot() -> None:
         .build()
     )
 
+    async def _inject_correlation_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        set_correlation_id(uuid.uuid4().hex)
+
+    app.add_handler(TypeHandler(Update, _inject_correlation_id), group=-1)
     app.add_handler(CallbackQueryHandler(handle_inline_callbacks))
     for root in sorted(known_roots()):
         app.add_handler(CommandHandler(root, handle_command_message))

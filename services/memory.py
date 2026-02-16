@@ -606,6 +606,29 @@ def init_db() -> None:
         retrieved_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     """)
+
+    # --- Soft Delete Migrations ---
+    # Ensure tables have deleted_at column
+    tables_for_soft_delete = [
+        "recipes",
+        "inventory_items",
+        "menu_items",
+        "vendors",
+        "vendor_items",
+        "prep_list_items",
+    ]
+    
+    for table in tables_for_soft_delete:
+        try:
+            cur.execute(f"PRAGMA table_info({table})")
+            cols = [row[1] for row in cur.fetchall()]
+            if "deleted_at" not in cols:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN deleted_at TEXT DEFAULT NULL")
+                print(f"Migrated {table}: added deleted_at column")
+        except Exception as e:
+            print(f"Migration warning for {table}: {e}")
+
+    con.commit()
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_price_estimates_item_time ON price_estimates(item_name, retrieved_at)"
     )
@@ -868,6 +891,25 @@ def init_db() -> None:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_doc_sources_file_sha ON doc_sources(file_sha256)"
         )
+
+    # Soft delete support: add deleted_at columns for critical tables
+    cur.execute("PRAGMA table_info(recipes)")
+    recipe_cols_sd = [row[1] for row in cur.fetchall()]
+    if "deleted_at" not in recipe_cols_sd:
+        cur.execute("ALTER TABLE recipes ADD COLUMN deleted_at TEXT")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_recipes_deleted ON recipes(deleted_at)")
+
+    cur.execute("PRAGMA table_info(inventory_items)")
+    inv_cols_sd = [row[1] for row in cur.fetchall()]
+    if "deleted_at" not in inv_cols_sd:
+        cur.execute("ALTER TABLE inventory_items ADD COLUMN deleted_at TEXT")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_inventory_deleted ON inventory_items(deleted_at)")
+
+    cur.execute("PRAGMA table_info(vendors)")
+    vendor_cols_sd = [row[1] for row in cur.fetchall()]
+    if "deleted_at" not in vendor_cols_sd:
+        cur.execute("ALTER TABLE vendors ADD COLUMN deleted_at TEXT")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_vendors_deleted ON vendors(deleted_at)")
 
     # Ensure autonomy_status row exists after upgrades.
     cur.execute("INSERT OR IGNORE INTO autonomy_status (id, is_running) VALUES (1, 0)")

@@ -12,14 +12,17 @@ from typing import Any, Dict, List, Optional
 
 import psutil
 import yaml
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import uuid
+from prep_brain.logging import configure_logging, set_correlation_id
 
 from services.brain import chat
 from services import autonomy as autonomy_service
 from services import lexicon
 from services import memory
+from services import metrics
 from services.transcriber import transcribe_file
 from prep_brain.config import load_config as pb_load_config
 
@@ -27,8 +30,17 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 APP_STARTED_AT = int(time.time())
 memory.init_db()
+configure_logging()
 
 app = FastAPI(title="Prep-Brain Dashboard API", version="1.0.0")
+
+@app.middleware("http")
+async def correlation_id_middleware(request: Request, call_next):
+    correlation_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    set_correlation_id(correlation_id)
+    response = await call_next(request)
+    response.headers["X-Correlation-ID"] = correlation_id
+    return response
 
 app.add_middleware(
     CORSMiddleware,
@@ -480,7 +492,8 @@ def get_rag_engine():
 
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
-    return {"ok": True, "started_at": APP_STARTED_AT}
+    from services.health import get_system_health
+    return get_system_health().to_dict()
 
 
 @app.get("/api/status")
@@ -2043,3 +2056,7 @@ def composer_draft(payload: DraftEmailPayload) -> Dict[str, Any]:
         body = response.replace(subject_match.group(0), "").strip()
 
     return {"vendor_email": vendor["email"] or "", "subject": subject, "body": body}
+
+@app.get("/api/metrics")
+async def get_metrics():
+    return metrics.metrics.get_all_metrics()
